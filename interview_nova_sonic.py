@@ -46,7 +46,7 @@ class InterviewNovaSonic:
         job_description: str = "",
         company_name: str = "",
         role_title: str = "",
-        model_id: str = "amazon.nova-sonic-v1:0",
+        model_id: str = "amazon.nova-2-sonic-v1:0",
         region: str = "us-east-1",
     ):
         self.model_id = model_id

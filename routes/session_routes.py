@@ -3,7 +3,12 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 import uuid
 import json
+import asyncio
+import logging
+import os
 from datetime import datetime
+
+import boto3
 
 from database import get_db, Session as SessionModel, Message, SessionScore
 from models import (
@@ -16,6 +21,8 @@ from models import (
     SessionAnalytics,
 )
 from auth import get_current_user_id
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/api/sessions", tags=["sessions"])
 
@@ -242,82 +249,214 @@ async def get_session_analytics(
     )
 
 
-async def _generate_session_scores(db: AsyncSession, session_id: str):
-    """Generate scores from interview messages using simple heuristic analysis.
-    In production, this would call an LLM for proper evaluation."""
-    result = await db.execute(
-        select(Message)
-        .where(Message.session_id == session_id)
-        .order_by(Message.timestamp.asc())
+# ─── Tool config for structured output via constrained decoding ──────
+
+SCORING_TOOL_CONFIG = {
+    "tools": [
+        {
+            "toolSpec": {
+                "name": "submit_interview_evaluation",
+                "description": "Submit the structured evaluation of a practice interview",
+                "inputSchema": {
+                    "json": {
+                        "type": "object",
+                        "properties": {
+                            "overall_score": {
+                                "type": "number",
+                                "description": "Weighted average score from 1.0 to 10.0",
+                            },
+                            "communication_score": {
+                                "type": "number",
+                                "description": "Clarity, articulation, structure of responses, use of examples (1.0-10.0)",
+                            },
+                            "technical_score": {
+                                "type": "number",
+                                "description": "Depth of technical knowledge, correct terminology, relevance to the role (1.0-10.0)",
+                            },
+                            "problem_solving_score": {
+                                "type": "number",
+                                "description": "Structured thinking, analytical approach, trade-off consideration (1.0-10.0)",
+                            },
+                            "confidence_score": {
+                                "type": "number",
+                                "description": "Decisiveness, assertiveness, absence of excessive hedging (1.0-10.0)",
+                            },
+                            "relevance_score": {
+                                "type": "number",
+                                "description": "How well answers address questions and relate to job requirements (1.0-10.0)",
+                            },
+                            "strengths": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "description": "A specific strength observed in the interview",
+                                },
+                                "description": "3-5 specific strengths observed",
+                            },
+                            "improvements": {
+                                "type": "array",
+                                "items": {
+                                    "type": "string",
+                                    "description": "A specific, actionable area for improvement",
+                                },
+                                "description": "3-5 specific, actionable areas for improvement",
+                            },
+                            "detailed_feedback": {
+                                "type": "string",
+                                "description": "2-4 sentence overall summary of the candidate's performance",
+                            },
+                            "question_scores": {
+                                "type": "array",
+                                "items": {
+                                    "type": "object",
+                                    "properties": {
+                                        "question": {
+                                            "type": "string",
+                                            "description": "The interviewer's question text",
+                                        },
+                                        "answer_summary": {
+                                            "type": "string",
+                                            "description": "1-2 sentence summary of the candidate's answer",
+                                        },
+                                        "score": {
+                                            "type": "number",
+                                            "description": "Score from 1.0 to 10.0. Use the full range: strong answers should be 7-10, average answers 4-6, weak answers 1-3. Differentiate between questions based on quality.",
+                                        },
+                                        "feedback": {
+                                            "type": "string",
+                                            "description": "1-2 sentence specific feedback for this answer",
+                                        },
+                                    },
+                                    "required": ["question", "answer_summary", "score", "feedback"],
+                                },
+                                "description": "Per-question evaluation, one entry per interviewer question",
+                            },
+                        },
+                        "required": [
+                            "overall_score",
+                            "communication_score",
+                            "technical_score",
+                            "problem_solving_score",
+                            "confidence_score",
+                            "relevance_score",
+                            "strengths",
+                            "improvements",
+                            "detailed_feedback",
+                            "question_scores",
+                        ],
+                    }
+                },
+            }
+        }
+    ],
+    "toolChoice": {"tool": {"name": "submit_interview_evaluation"}},
+}
+
+
+def _build_scoring_prompt(messages_data: list, job_description: str, role_title: str) -> str:
+    """Build the user prompt for interview evaluation."""
+    transcript_lines = []
+    for role, content in messages_data:
+        speaker = "Interviewer" if role == "ASSISTANT" else "Candidate"
+        transcript_lines.append(f"{speaker}: {content}")
+    transcript = "\n".join(transcript_lines)
+
+    return f"""Analyze the following practice interview transcript and evaluate the candidate's performance.
+
+Role: {role_title or 'Not specified'}
+Job Description: {job_description or 'Not specified'}
+
+--- TRANSCRIPT ---
+{transcript}
+--- END TRANSCRIPT ---
+
+Evaluate the candidate on communication, technical knowledge, problem solving, confidence, and relevance. Provide an overall score, specific strengths, areas for improvement, detailed feedback, and per-question scores.
+
+IMPORTANT: Use the full 1-10 scoring range. Do NOT give the same score for every question. Differentiate based on quality — strong, specific answers with examples should score higher (7-10) than vague or incomplete answers (1-5). Be honest and critical."""
+
+
+def _call_nova_lite(prompt: str) -> dict:
+    """Call Amazon Nova Lite via Bedrock Converse API with structured output.
+    Uses toolConfig with constrained decoding for guaranteed schema compliance.
+    Runs in a thread executor from the async caller."""
+    region = os.getenv("AWS_REGION", "us-east-1")
+    client = boto3.client("bedrock-runtime", region_name=region)
+
+    response = client.converse(
+        modelId="amazon.nova-lite-v1:0",
+        system=[{"text": "You are an expert interview coach who provides detailed, constructive evaluations of practice interview performances."}],
+        messages=[
+            {
+                "role": "user",
+                "content": [{"text": prompt}],
+            }
+        ],
+        inferenceConfig={
+            "maxTokens": 4096,
+            "temperature": 0.5,
+            "topP": 0.9,
+        },
+        toolConfig=SCORING_TOOL_CONFIG,
     )
-    rows = result.scalars().all()
-    messages_data = [(m.role, m.content) for m in rows]
 
-    if not messages_data:
-        return
+    # With constrained decoding, the response comes as a tool use result — already parsed
+    output_message = response["output"]["message"]
+    for content_block in output_message["content"]:
+        if "toolUse" in content_block:
+            return content_block["toolUse"]["input"]
 
-    # Simple heuristics for scoring
+    # Shouldn't happen with toolChoice forcing the tool, but handle gracefully
+    raise ValueError("No tool use result found in Nova response")
+
+
+def _heuristic_fallback(messages_data: list) -> dict:
+    """Original heuristic scoring as a fallback."""
     user_messages = [m[1] for m in messages_data if m[0] == "USER"]
     assistant_messages = [m[1] for m in messages_data if m[0] == "ASSISTANT"]
 
-    # Heuristic scoring
     total_user_words = sum(len(m.split()) for m in user_messages)
     avg_response_length = total_user_words / max(len(user_messages), 1)
 
-    # Score based on response length (longer = more detailed = better, up to a point)
     communication = min(10, max(3, avg_response_length / 5))
-    # Technical: based on keyword density
     technical_keywords = ["algorithm", "system", "design", "implement", "optimize", "database", "api", "architecture", "scale", "performance", "complexity", "data structure"]
     tech_count = sum(1 for m in user_messages for k in technical_keywords if k in m.lower())
     technical = min(10, max(3, 3 + tech_count * 0.8))
-    # Problem solving: based on structured answers
     structure_keywords = ["first", "then", "because", "approach", "solution", "consider", "trade-off", "alternatively"]
     struct_count = sum(1 for m in user_messages for k in structure_keywords if k in m.lower())
     problem_solving = min(10, max(3, 3 + struct_count * 0.7))
-    # Confidence: based on hedging language (fewer hedges = more confident)
     hedge_words = ["maybe", "i think", "probably", "not sure", "i guess", "kind of", "sort of"]
     hedge_count = sum(1 for m in user_messages for k in hedge_words if k in m.lower())
     confidence = min(10, max(3, 8 - hedge_count * 0.5))
-    # Relevance: based on number of responses vs questions
     questions = [m for m in assistant_messages if m.strip().endswith("?")]
     relevance = min(10, max(3, 5 + min(len(user_messages), len(questions)) * 0.5))
-
     overall = round((communication + technical + problem_solving + confidence + relevance) / 5, 1)
 
-    # Generate strengths and improvements
     strengths = []
     improvements = []
-
     if avg_response_length > 20:
         strengths.append("Provides detailed and thorough responses")
     else:
         improvements.append("Try to elaborate more on your answers with specific examples")
-
     if tech_count > 2:
         strengths.append("Demonstrates strong technical vocabulary")
     else:
         improvements.append("Incorporate more technical terminology relevant to the role")
-
     if struct_count > 2:
         strengths.append("Shows structured problem-solving approach")
     else:
         improvements.append("Structure your answers with a clear beginning, middle, and end")
-
     if hedge_count < 2:
         strengths.append("Projects confidence in responses")
     else:
         improvements.append("Reduce hedging language to project more confidence")
-
     if len(user_messages) >= len(questions) * 0.8:
         strengths.append("Addresses most questions raised by the interviewer")
     else:
         improvements.append("Make sure to address each question asked by the interviewer")
 
-    # Generate question-level scores
     question_scores = []
     for i, (role, content) in enumerate(messages_data):
         if role == "ASSISTANT" and content.strip().endswith("?"):
-            # Find the next user response
             user_response = ""
             for j in range(i + 1, len(messages_data)):
                 if messages_data[j][0] == "USER":
@@ -333,6 +472,63 @@ async def _generate_session_scores(db: AsyncSession, session_id: str):
                     "feedback": "Good response" if q_score >= 6 else "Could be more detailed",
                 })
 
+    return {
+        "overall_score": overall,
+        "communication_score": round(communication, 1),
+        "technical_score": round(technical, 1),
+        "problem_solving_score": round(problem_solving, 1),
+        "confidence_score": round(confidence, 1),
+        "relevance_score": round(relevance, 1),
+        "strengths": strengths,
+        "improvements": improvements,
+        "detailed_feedback": (
+            f"Interview session completed with {len(user_messages)} responses to {len(questions)} questions. "
+            f"Average response length: {int(avg_response_length)} words."
+        ),
+        "question_scores": question_scores,
+    }
+
+
+async def _generate_session_scores(db: AsyncSession, session_id: str):
+    """Generate scores from interview messages using Amazon Nova Lite AI analysis.
+    Falls back to heuristic scoring if the AI call fails."""
+    result = await db.execute(
+        select(Message)
+        .where(Message.session_id == session_id)
+        .order_by(Message.timestamp.asc())
+    )
+    rows = result.scalars().all()
+    messages_data = [(m.role, m.content) for m in rows]
+
+    if not messages_data:
+        return
+
+    # Get session context for the AI prompt
+    session_result = await db.execute(
+        select(SessionModel).where(SessionModel.id == session_id)
+    )
+    session_row = session_result.scalar_one_or_none()
+    job_description = session_row.job_description if session_row else ""
+    role_title = session_row.role_title if session_row else ""
+
+    # Try AI scoring, fall back to heuristic
+    scores = None
+    try:
+        prompt = _build_scoring_prompt(messages_data, job_description, role_title)
+        logger.info(f"Calling Amazon Nova Lite for interview scoring (session {session_id})")
+        scores = await asyncio.to_thread(_call_nova_lite, prompt)
+        logger.info(f"AI scoring completed for session {session_id}")
+    except Exception as e:
+        logger.warning(f"AI scoring failed for session {session_id}, falling back to heuristic: {e}")
+        scores = _heuristic_fallback(messages_data)
+
+    # Validate and clamp scores
+    def clamp(val, lo=1.0, hi=10.0):
+        try:
+            return round(min(hi, max(lo, float(val))), 1)
+        except (TypeError, ValueError):
+            return 5.0
+
     # Upsert: delete existing score if any, then insert new one
     existing = await db.execute(
         select(SessionScore).where(SessionScore.session_id == session_id)
@@ -347,19 +543,16 @@ async def _generate_session_scores(db: AsyncSession, session_id: str):
     new_score = SessionScore(
         id=score_id,
         session_id=session_id,
-        overall_score=overall,
-        communication_score=round(communication, 1),
-        technical_score=round(technical, 1),
-        problem_solving_score=round(problem_solving, 1),
-        confidence_score=round(confidence, 1),
-        relevance_score=round(relevance, 1),
-        strengths=json.dumps(strengths),
-        improvements=json.dumps(improvements),
-        detailed_feedback=(
-            f"Interview session completed with {len(user_messages)} responses to {len(questions)} questions. "
-            f"Average response length: {int(avg_response_length)} words."
-        ),
-        question_scores=json.dumps(question_scores),
+        overall_score=clamp(scores.get("overall_score", 5)),
+        communication_score=clamp(scores.get("communication_score", 5)),
+        technical_score=clamp(scores.get("technical_score", 5)),
+        problem_solving_score=clamp(scores.get("problem_solving_score", 5)),
+        confidence_score=clamp(scores.get("confidence_score", 5)),
+        relevance_score=clamp(scores.get("relevance_score", 5)),
+        strengths=json.dumps(scores.get("strengths", [])),
+        improvements=json.dumps(scores.get("improvements", [])),
+        detailed_feedback=scores.get("detailed_feedback", ""),
+        question_scores=json.dumps(scores.get("question_scores", [])),
         created_at=now,
     )
     db.add(new_score)
