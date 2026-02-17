@@ -33,9 +33,17 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="Interviewed API", lifespan=lifespan)
 
+# CORS Configuration
+ALLOWED_ORIGINS = [
+    "http://localhost:3000",       # Next.js Default
+    "http://127.0.0.1:3000",
+    "https://interviewed.space",    # Production Frontend (assumed)
+    "https://www.interviewed.space",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
