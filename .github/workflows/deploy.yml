@@ -39,49 +39,18 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} bash << 'ENDSSH'
             set -e
             
-            # Debug: Show current directory and list contents
-            echo "📍 Current directory: $(pwd)"
-            echo "📂 Directory contents:"
-            ls -la
-            
-            # Navigate to backend directory (try multiple possible locations)
-            if [ -d "interviewed-backend" ]; then
-              cd interviewed-backend
-            elif [ -d "backend" ]; then
-              cd backend
-            elif [ -d "$HOME/interviewed-backend" ]; then
-              cd $HOME/interviewed-backend
-            elif [ -d "$HOME/backend" ]; then
-              cd $HOME/backend
-            else
-              echo "❌ Error: Cannot find backend directory!"
-              echo "Available directories:"
-              ls -la ~
-              exit 1
-            fi
-            
-            echo "✅ Found backend at: $(pwd)"
-            
-            # Stash any local changes to avoid conflicts
-            git stash
+            # Navigate to backend directory
+            cd interviewed-backend
             
             # Pull latest changes
-            echo "📥 Pulling latest code..."
+            git stash
             git pull origin main
             
-            # Show latest commit
-            echo "📝 Latest commit:"
-            git log --oneline -1
-            
-            # Activate virtual environment
+            # Activate virtual environment and install dependencies
             source venv/bin/activate
-            
-            # Install/update dependencies
-            echo "📦 Installing dependencies..."
-            pip install -r requirements.txt
+            pip install -q -r requirements.txt
             
             # Set up environment variables
-            echo "🔐 Setting up environment variables..."
             cat > .env << 'ENVEOF'
           DATABASE_URL=${{ secrets.DATABASE_URL }}
           AWS_REGION=${{ secrets.AWS_REGION }}
@@ -89,21 +58,10 @@ jobs:
           AWS_SECRET_ACCESS_KEY=${{ secrets.AWS_SECRET_ACCESS_KEY }}
           ENVEOF
             
-            # Force restart the application (delete and recreate for clean restart)
-            echo "🔄 Restarting application..."
-            pm2 delete interviewed-backend || true
+            # Restart application
+            pm2 delete interviewed-backend 2>/dev/null || true
             pm2 start start.sh --name interviewed-backend
-            
-            # Save PM2 configuration
             pm2 save
-            
-            # Show status
-            echo "✅ Deployment complete!"
-            pm2 status
-            
-            # Show recent logs
-            echo "📊 Recent logs:"
-            pm2 logs interviewed-backend --lines 10 --nostream
           ENDSSH
 
       - name: ✅ Deployment Complete
