@@ -40,7 +40,7 @@ jobs:
             set -e  # Exit on any error
             
             # Navigate to backend directory
-            cd ~/interviewed-backend
+            cd $HOME/interviewed-backend
             
             # Stash any local changes to avoid conflicts
             git stash
