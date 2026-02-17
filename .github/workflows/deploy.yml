@@ -39,8 +39,28 @@ jobs:
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} bash << 'ENDSSH'
             set -e
             
-            # Navigate to backend directory
-            cd interviewed-backend
+            # Debug: Show current directory and list contents
+            echo "📍 Current directory: $(pwd)"
+            echo "📂 Directory contents:"
+            ls -la
+            
+            # Navigate to backend directory (try multiple possible locations)
+            if [ -d "interviewed-backend" ]; then
+              cd interviewed-backend
+            elif [ -d "backend" ]; then
+              cd backend
+            elif [ -d "$HOME/interviewed-backend" ]; then
+              cd $HOME/interviewed-backend
+            elif [ -d "$HOME/backend" ]; then
+              cd $HOME/backend
+            else
+              echo "❌ Error: Cannot find backend directory!"
+              echo "Available directories:"
+              ls -la ~
+              exit 1
+            fi
+            
+            echo "✅ Found backend at: $(pwd)"
             
             # Stash any local changes to avoid conflicts
             git stash
