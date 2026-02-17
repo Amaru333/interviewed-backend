@@ -440,7 +440,7 @@ async def interview_websocket(websocket: WebSocket, session_id: str, token: str 
 
 @app.get("/api/health")
 async def health():
-    return {"status": "ok", "service": "interviewed", "uptime": time.time()}
+    return {"status": "ok", "service": "interviewed", "uptime": time.time(), "version": "1.0.0"}
 
 
 if __name__ == "__main__":

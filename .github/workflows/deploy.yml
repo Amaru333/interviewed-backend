@@ -37,19 +37,31 @@ jobs:
           AWS_REGION: ${{ secrets.AWS_REGION }}
         run: |
           ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=no ${{ secrets.EC2_USER }}@${{ secrets.EC2_HOST }} << 'ENDSSH'
+            set -e  # Exit on any error
+            
             # Navigate to backend directory
             cd ~/backend
             
+            # Stash any local changes to avoid conflicts
+            git stash
+            
             # Pull latest changes
+            echo "📥 Pulling latest code..."
             git pull origin main
+            
+            # Show latest commit
+            echo "📝 Latest commit:"
+            git log --oneline -1
             
             # Activate virtual environment
             source venv/bin/activate
             
             # Install/update dependencies
+            echo "📦 Installing dependencies..."
             pip install -r requirements.txt
             
             # Set up environment variables
+            echo "🔐 Setting up environment variables..."
             cat > .env << EOF
           DATABASE_URL=${{ secrets.DATABASE_URL }}
           AWS_REGION=${{ secrets.AWS_REGION }}
@@ -61,14 +73,21 @@ jobs:
             # Uncomment if you're using Alembic or similar:
             # alembic upgrade head
             
-            # Restart the application with PM2
-            pm2 restart interviewed-backend || pm2 start start.sh --name interviewed-backend
+            # Force restart the application (delete and recreate for clean restart)
+            echo "🔄 Restarting application..."
+            pm2 delete interviewed-backend || true
+            pm2 start start.sh --name interviewed-backend
             
             # Save PM2 configuration
             pm2 save
             
             # Show status
+            echo "✅ Deployment complete!"
             pm2 status
+            
+            # Show recent logs
+            echo "📊 Recent logs:"
+            pm2 logs interviewed-backend --lines 10 --nostream
           ENDSSH
 
       - name: ✅ Deployment Complete
