@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import init_db, async_session, Session as SessionModel, User, Message
-from interview_nova_sonic import InterviewNovaSonic, CHUNK_SIZE
+from interview_nova_sonic import InterviewNovaSonic, CHUNK_SIZE, pick_random_persona
 from auth import SECRET_KEY, ALGORITHM
 from routes.auth_routes import router as auth_router
 from routes.session_routes import router as session_router
@@ -110,13 +110,30 @@ class InterviewConnectionManager:
                 session.status = "active"
                 await db.commit()
 
-        # Create Nova Sonic client with interview context
+        # Pick a random interviewer persona for this session
+        persona = pick_random_persona()
+
+        # Create Nova Sonic client with interview context and persona
         self.nova_client = InterviewNovaSonic(
             resume_text=resume_text,
             job_description=job_description,
             company_name=company_name,
             role_title=role_title,
+            persona=persona,
         )
+        self.interviewer_name = persona["name"]
+
+        # Store interviewer info on the session record
+        async with async_session() as db:
+            from sqlalchemy import select
+            result = await db.execute(
+                select(SessionModel).where(SessionModel.id == self.session_id)
+            )
+            session = result.scalar_one_or_none()
+            if session:
+                session.interviewer_name = persona["name"]
+                session.interviewer_voice = persona["voice"]
+                await db.commit()
         await self.nova_client.start_session()
         logger.info("Interview Nova Sonic session started")
 
@@ -391,6 +408,7 @@ async def interview_websocket(websocket: WebSocket, session_id: str, token: str 
             "init": {
                 "sessionId": session_id,
                 "status": "connected",
+                "interviewerName": manager.interviewer_name,
             }
         }
     }))

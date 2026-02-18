@@ -35,6 +35,8 @@ def _session_to_response(s: SessionModel) -> SessionResponse:
         job_description=s.job_description,
         company_name=s.company_name or "",
         role_title=s.role_title or "",
+        interviewer_name=s.interviewer_name or "",
+        interviewer_voice=s.interviewer_voice or "",
         status=s.status,
         created_at=str(s.created_at) if s.created_at else "",
         completed_at=str(s.completed_at) if s.completed_at else None,
@@ -75,6 +77,108 @@ async def create_session(
     )
 
 
+@router.get("/progress")
+async def get_progress(
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Return aggregated progress data across all completed sessions."""
+    # Get all completed sessions with their scores
+    result = await db.execute(
+        select(SessionModel, SessionScore)
+        .outerjoin(SessionScore, SessionModel.id == SessionScore.session_id)
+        .where(SessionModel.user_id == user_id)
+        .order_by(SessionModel.created_at.asc())
+    )
+    rows = result.all()
+
+    total_sessions = len(rows)
+    completed_sessions = sum(1 for s, _ in rows if s.status == "completed")
+    scored_rows = [(s, sc) for s, sc in rows if sc is not None]
+
+    # Score trend (chronological)
+    score_trend = []
+    for s, sc in scored_rows:
+        score_trend.append({
+            "session_name": s.name,
+            "date": s.created_at.strftime("%Y-%m-%d") if s.created_at else "",
+            "overall": round(sc.overall_score, 1),
+            "communication": round(sc.communication_score, 1),
+            "technical": round(sc.technical_score, 1),
+            "problem_solving": round(sc.problem_solving_score, 1),
+            "confidence": round(sc.confidence_score, 1),
+            "relevance": round(sc.relevance_score, 1),
+        })
+
+    # Skill averages
+    if scored_rows:
+        n = len(scored_rows)
+        skill_averages = {
+            "communication": round(sum(sc.communication_score for _, sc in scored_rows) / n, 1),
+            "technical": round(sum(sc.technical_score for _, sc in scored_rows) / n, 1),
+            "problem_solving": round(sum(sc.problem_solving_score for _, sc in scored_rows) / n, 1),
+            "confidence": round(sum(sc.confidence_score for _, sc in scored_rows) / n, 1),
+            "relevance": round(sum(sc.relevance_score for _, sc in scored_rows) / n, 1),
+        }
+        average_score = round(sum(sc.overall_score for _, sc in scored_rows) / n, 1)
+        best_score = round(max(sc.overall_score for _, sc in scored_rows), 1)
+
+        # Top / weakest
+        top_strength = max(skill_averages, key=skill_averages.get)
+        weakest_skill = min(skill_averages, key=skill_averages.get)
+    else:
+        skill_averages = {"communication": 0, "technical": 0, "problem_solving": 0, "confidence": 0, "relevance": 0}
+        average_score = 0
+        best_score = 0
+        top_strength = None
+        weakest_skill = None
+
+    # Total practice minutes
+    total_minutes = 0
+    for s, _ in rows:
+        if s.completed_at and s.created_at:
+            try:
+                total_minutes += (s.completed_at - s.created_at).total_seconds() / 60
+            except Exception:
+                pass
+    total_practice_minutes = round(total_minutes)
+
+    # Current streak: consecutive days with at least one completed session (going backwards from today)
+    from datetime import date as date_type
+    completed_dates = set()
+    for s, _ in rows:
+        if s.status == "completed" and s.completed_at:
+            completed_dates.add(s.completed_at.date())
+
+    current_streak = 0
+    check_date = date_type.today()
+    while check_date in completed_dates:
+        current_streak += 1
+        check_date = check_date - __import__("datetime").timedelta(days=1)
+
+    # Pretty names for skills
+    skill_labels = {
+        "communication": "Communication",
+        "technical": "Technical",
+        "problem_solving": "Problem Solving",
+        "confidence": "Confidence",
+        "relevance": "Relevance",
+    }
+
+    return {
+        "total_sessions": total_sessions,
+        "completed_sessions": completed_sessions,
+        "average_score": average_score,
+        "best_score": best_score,
+        "total_practice_minutes": total_practice_minutes,
+        "current_streak": current_streak,
+        "score_trend": score_trend,
+        "skill_averages": skill_averages,
+        "top_strength": skill_labels.get(top_strength, top_strength) if top_strength else None,
+        "weakest_skill": skill_labels.get(weakest_skill, weakest_skill) if weakest_skill else None,
+    }
+
+
 @router.get("/", response_model=SessionListResponse)
 async def list_sessions(
     user_id: str = Depends(get_current_user_id),
@@ -87,6 +191,7 @@ async def list_sessions(
     )
     rows = result.scalars().all()
     return SessionListResponse(sessions=[_session_to_response(s) for s in rows])
+
 
 
 @router.get("/{session_id}", response_model=SessionResponse)

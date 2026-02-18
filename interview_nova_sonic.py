@@ -3,6 +3,7 @@ import asyncio
 import base64
 import json
 import uuid
+import random
 import boto3
 from aws_sdk_bedrock_runtime.client import BedrockRuntimeClient, InvokeModelWithBidirectionalStreamOperationInput
 from aws_sdk_bedrock_runtime.models import InvokeModelWithBidirectionalStreamInputChunk, BidirectionalInputPayloadPart
@@ -16,6 +17,29 @@ INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
 CHANNELS = 1
 CHUNK_SIZE = 512
+
+# ─── Interviewer Personas ────────────────────────────────────
+# Each persona has a name, Nova Sonic voiceId, gender, and personality style.
+# Voices are gender-matched to names.
+INTERVIEWER_PERSONAS = [
+    # Masculine voices
+    {"name": "James",  "voice": "matthew",  "gender": "male",   "style": "warm and encouraging"},
+    {"name": "Marcus", "voice": "matthew",  "gender": "male",   "style": "direct and analytical"},
+    {"name": "Daniel", "voice": "matthew",  "gender": "male",   "style": "casual and conversational"},
+    {"name": "Raj",    "voice": "arjun",    "gender": "male",   "style": "thoughtful and methodical"},
+    {"name": "David",  "voice": "matthew",  "gender": "male",   "style": "friendly and approachable"},
+    # Feminine voices
+    {"name": "Sarah",  "voice": "tiffany",  "gender": "female", "style": "professional and structured"},
+    {"name": "Emily",  "voice": "tiffany",  "gender": "female", "style": "warm and supportive"},
+    {"name": "Priya",  "voice": "kiara",    "gender": "female", "style": "insightful and engaging"},
+    {"name": "Rachel", "voice": "amy",      "gender": "female", "style": "direct and efficient"},
+    {"name": "Olivia", "voice": "olivia",   "gender": "female", "style": "friendly and encouraging"},
+]
+
+
+def pick_random_persona() -> dict:
+    """Select a random interviewer persona."""
+    return random.choice(INTERVIEWER_PERSONAS)
 
 
 def get_aws_credentials_resolver():
@@ -46,6 +70,7 @@ class InterviewNovaSonic:
         job_description: str = "",
         company_name: str = "",
         role_title: str = "",
+        persona: dict | None = None,
         model_id: str = "amazon.nova-2-sonic-v1:0",
         region: str = "us-east-1",
     ):
@@ -67,6 +92,8 @@ class InterviewNovaSonic:
         self.job_description = job_description
         self.company_name = company_name
         self.role_title = role_title
+        # Persona: randomly assigned if not provided
+        self.persona = persona or pick_random_persona()
 
     def _initialize_client(self):
         config = Config(
@@ -85,43 +112,73 @@ class InterviewNovaSonic:
         await self.stream.input_stream.send(event)
 
     def _build_system_prompt(self) -> str:
-        """Build the system prompt for the interview session."""
+        """Build a dynamic, natural-sounding system prompt based on the assigned persona."""
+        name = self.persona["name"]
+        style = self.persona["style"]
         role_info = self.role_title or "the position"
         company_info = f" at {self.company_name}" if self.company_name else ""
 
-        prompt = f"""You are Alex, a professional and experienced interviewer conducting a practice interview for {role_info}{company_info}. 
+        # Pick a random greeting template so the opening line varies each time
+        greetings = [
+            f"Hey, thanks for joining! I'm {name}, I'll be your interviewer today.",
+            f"Hi! My name's {name}. Great to meet you — let's get started.",
+            f"Hello! I'm {name}. Thanks for taking the time to chat with me today.",
+            f"Hey there, I'm {name}. Excited to learn more about you — ready to jump in?",
+            f"Hi, welcome! I'm {name}, and I'll be walking you through this interview.",
+            f"Good to meet you! I'm {name}. Let's have a conversation about your background.",
+        ]
+        greeting = random.choice(greetings)
 
-Your job is to simulate a realistic interview experience. Follow these rules strictly:
+        # Pick a random icebreaker so the first question varies too
+        icebreakers = [
+            "Tell me a bit about yourself and your background.",
+            "I'd love to hear your story — what's your professional background?",
+            "Before we dive in, give me a quick overview of where you're at in your career.",
+            "Let's start easy — walk me through your professional journey so far.",
+            "To kick things off, tell me what brought you to this field.",
+        ]
+        icebreaker = random.choice(icebreakers)
 
-1. INTERVIEW STRUCTURE:
-   - Start with a warm greeting: "Hi there! I'm Alex, and I'll be conducting your interview today."
-   - Begin with a simple icebreaker question (e.g., "Tell me about yourself")
-   - Progress through behavioral, situational, and technical questions relevant to the role
-   - Ask 5-8 questions total during the interview
-   - After the last question, wrap up the interview professionally
+        prompt = f"""You are {name}, an experienced interviewer conducting a practice interview for {role_info}{company_info}.
 
-2. INTERVIEW STYLE:
-   - Be professional but friendly, like a real interviewer
-   - Listen carefully to responses and ask relevant follow-up questions
-   - Keep your responses short and conversational (2-3 sentences max)
-   - Don't give feedback or coaching during the interview - save that for after
-   - If the candidate gives a vague answer, probe deeper with follow-up questions
+Your personality is {style}. Let that come through naturally in how you speak — don't be robotic or overly formal. Talk like a real person having a professional conversation.
 
-3. CONTEXT:
+RULES:
+
+1. OPENING:
+   - Greet the candidate naturally: "{greeting}"
+   - Start with this icebreaker: "{icebreaker}"
+
+2. INTERVIEW FLOW:
+   - Ask 5-8 questions total, progressing from general to more specific
+   - Mix behavioral, technical, and situational questions relevant to the role
+   - Ask follow-up questions when answers are vague or interesting
+   - Transition between questions naturally — acknowledge what they said, react briefly, then move on
+   - Wrap up professionally when done
+
+3. HOW TO SPEAK:
+   - Be conversational — use natural transitions like "That's interesting", "Got it", "Nice", "Makes sense"
+   - Keep responses SHORT (1-3 sentences before the next question)
+   - Vary your reactions — don't repeat the same phrases
+   - Don't give feedback, scores, or coaching tips during the interview
+   - If they give a great answer, you can briefly acknowledge it before moving on
+   - If they struggle, gently rephrase or offer a related angle
+
+4. CONTEXT:
    - Job Description: {self.job_description}
    - Candidate Resume: {self.resume_text if self.resume_text else 'Not provided'}
-   
-4. QUESTION TYPES TO INCLUDE:
-   - Behavioral questions (STAR format expected)
-   - Technical questions relevant to the job description
-   - Situational/hypothetical questions
-   - Questions about the candidate's experience from their resume
 
-5. IMPORTANT:
-   - Stay in character as an interviewer throughout
-   - Do NOT break character or provide tips during the interview
-   - React naturally to answers before moving to the next question
-   - When wrapping up, thank the candidate and let them know the interview is complete"""
+5. QUESTION MIX:
+   - Behavioral ("Tell me about a time when...")
+   - Technical (relevant to the job description)
+   - Situational / hypothetical scenarios
+   - Resume-specific questions about their past experience
+
+6. IMPORTANT:
+   - Stay in character as {name} throughout — you are a human interviewer, not an AI
+   - Never break character, mention AI, or provide tips
+   - Sound natural, not scripted — vary your word choice and phrasing
+   - When wrapping up, thank the candidate warmly and let them know the interview is complete"""
 
         return prompt
 
@@ -160,7 +217,7 @@ Your job is to simulate a realistic interview experience. Follow these rules str
                         "sampleRateHertz": 24000,
                         "sampleSizeBits": 16,
                         "channelCount": 1,
-                        "voiceId": "matthew",
+                        "voiceId": self.persona["voice"],
                         "encoding": "base64",
                         "audioType": "SPEECH",
                     },

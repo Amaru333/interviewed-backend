@@ -47,6 +47,8 @@ class SessionResponse(BaseModel):
     job_description: str
     company_name: str
     role_title: str
+    interviewer_name: Optional[str] = ""
+    interviewer_voice: Optional[str] = ""
     status: str
     created_at: str
     completed_at: Optional[str] = None
