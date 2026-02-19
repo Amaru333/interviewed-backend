@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import init_db, async_session, Session as SessionModel, User, Message
-from interview_nova_sonic import InterviewNovaSonic, CHUNK_SIZE, pick_random_persona
+from interview_nova_sonic import InterviewNovaSonic, pick_random_persona, CHUNK_SIZE
 from auth import SECRET_KEY, ALGORITHM
 from routes.auth_routes import router as auth_router
 from routes.session_routes import router as session_router
@@ -86,9 +86,6 @@ class InterviewConnectionManager:
         self.user_id = user_id
         self.nova_client: InterviewNovaSonic | None = None
         self.active_connection: WebSocket | None = None
-        self.audio_content_started = False
-        self.last_audio_chunk_time = 0
-        self.audio_chunk_threshold = 0.1
         self.chat_history = []
         self.max_history = 30
         # Message accumulation buffers
@@ -111,8 +108,13 @@ class InterviewConnectionManager:
         if len(self.chat_history) > self.max_history:
             self.chat_history = self.chat_history[-self.max_history:]
 
+    # Nova Sonic's text-history context window is limited.  Replaying too many
+    # messages causes "Chat history is over max limit".  We keep only the most
+    # recent turns and ensure the list starts with a USER message (required).
+    MAX_REPLAY_MESSAGES = 16
+
     async def _load_history_from_db(self) -> list[dict]:
-        """Load the full conversation history from DB for reconnect replay (no cap)."""
+        """Load conversation history from DB, trimmed to fit Nova Sonic's limit."""
         async with async_session() as db:
             from sqlalchemy import select
             result = await db.execute(
@@ -121,10 +123,47 @@ class InterviewConnectionManager:
                 .order_by(Message.timestamp.asc())
             )
             rows = result.scalars().all()
-            return [
+            all_msgs = [
                 {"role": m.role, "text": m.content, "contentName": str(uuid.uuid4())}
                 for m in rows
             ]
+            # Trim to the most recent N messages
+            if len(all_msgs) > self.MAX_REPLAY_MESSAGES:
+                all_msgs = all_msgs[-self.MAX_REPLAY_MESSAGES:]
+            # History must start with a USER message per Nova Sonic docs
+            while all_msgs and all_msgs[0]["role"] != "USER":
+                all_msgs.pop(0)
+            return all_msgs
+
+    async def _replay_history(self, history: list[dict]):
+        """Send conversation history to Nova Sonic as non-interactive text context."""
+        for msg in history:
+            content_name = msg["contentName"]
+            role = msg["role"]
+            text = msg["text"]
+            await self.nova_client.send_event(json.dumps({
+                "event": {"contentStart": {
+                    "promptName": self.nova_client.prompt_name,
+                    "contentName": content_name,
+                    "type": "TEXT",
+                    "interactive": False,
+                    "role": role,
+                    "textInputConfiguration": {"mediaType": "text/plain"},
+                }}
+            }))
+            await self.nova_client.send_event(json.dumps({
+                "event": {"textInput": {
+                    "promptName": self.nova_client.prompt_name,
+                    "contentName": content_name,
+                    "content": text,
+                }}
+            }))
+            await self.nova_client.send_event(json.dumps({
+                "event": {"contentEnd": {
+                    "promptName": self.nova_client.prompt_name,
+                    "contentName": content_name,
+                }}
+            }))
 
     async def save_message(self, role: str, content: str):
         """Save a message to the database."""
@@ -194,47 +233,10 @@ class InterviewConnectionManager:
         await self.nova_client.start_session()
         logger.info("Interview Nova Sonic session started")
 
-        # Replay conversation history from DB (full history, no in-memory cap)
+        # Replay conversation history (trimmed to fit Nova Sonic's context limit)
         history = await self._load_history_from_db()
-        while history and history[0]["role"] != "USER":
-            history.pop(0)
         if history:
-            for msg in history:
-                content_name = msg["contentName"]
-                role = msg["role"]
-                text = msg["text"]
-                content_start = json.dumps({
-                    "event": {
-                        "contentStart": {
-                            "promptName": self.nova_client.prompt_name,
-                            "contentName": content_name,
-                            "type": "TEXT",
-                            "interactive": False,
-                            "role": role,
-                            "textInputConfiguration": {"mediaType": "text/plain"},
-                        }
-                    }
-                })
-                await self.nova_client.send_event(content_start)
-                text_input = json.dumps({
-                    "event": {
-                        "textInput": {
-                            "promptName": self.nova_client.prompt_name,
-                            "contentName": content_name,
-                            "content": text,
-                        }
-                    }
-                })
-                await self.nova_client.send_event(text_input)
-                content_end = json.dumps({
-                    "event": {
-                        "contentEnd": {
-                            "promptName": self.nova_client.prompt_name,
-                            "contentName": content_name,
-                        }
-                    }
-                })
-                await self.nova_client.send_event(content_end)
+            await self._replay_history(history)
         
         # Auto-start: inject a system-level kick-off text so the AI introduces itself
         # immediately without waiting for the user to speak first.
@@ -278,6 +280,11 @@ class InterviewConnectionManager:
             })
             await self.nova_client.send_event(greeting_end)
 
+        # Open the single persistent audio stream LAST, after all context is sent.
+        # Per AWS docs, this container stays open for the entire session.
+        await self.nova_client.open_audio_stream()
+        logger.info("Audio stream opened — ready for continuous streaming")
+
 
     async def disconnect(self):
         # Save any remaining accumulated messages
@@ -289,44 +296,20 @@ class InterviewConnectionManager:
             await self.save_message("ASSISTANT", self.current_assistant_message.strip())
             self.add_history("ASSISTANT", self.current_assistant_message.strip())
             self.current_assistant_message = ""
-        
+
         if self.nova_client:
             logger.info("Stopping interview session")
-            if self.audio_content_started:
-                await self.stop_audio()
             self.nova_client.is_active = False
             await self.nova_client.end_session()
             self.nova_client = None
         self.active_connection = None
 
     async def receive_audio(self, audio_data: bytes):
-        if self.nova_client and self.audio_content_started:
+        if self.nova_client and self.nova_client.is_active:
             try:
-                current_time = time.time()
-                if current_time - self.last_audio_chunk_time >= self.audio_chunk_threshold:
-                    await self.nova_client.send_audio_chunk(audio_data)
-                    self.last_audio_chunk_time = current_time
+                await self.nova_client.send_audio_chunk(audio_data)
             except Exception as e:
                 logger.error(f"Error sending audio chunk: {e}")
-
-    async def start_audio(self):
-        if self.nova_client and not self.audio_content_started:
-            try:
-                logger.info("Starting audio input")
-                self.nova_client.audio_content_name = str(uuid.uuid4())
-                await self.nova_client.start_audio_input()
-                self.audio_content_started = True
-            except Exception as e:
-                logger.error(f"Error starting audio: {e}")
-
-    async def stop_audio(self):
-        if self.nova_client and self.audio_content_started:
-            try:
-                logger.info("Stopping audio input")
-                await self.nova_client.end_audio_input()
-                self.audio_content_started = False
-            except Exception as e:
-                logger.error(f"Error stopping audio: {e}")
 
     async def _auto_reconnect(self) -> bool:
         """Transparently restart Nova Sonic session after a timeout.
@@ -351,8 +334,6 @@ class InterviewConnectionManager:
             except Exception:
                 pass
 
-            self.audio_content_started = False
-
             # Create a fresh Nova Sonic client with the same interview context
             self.nova_client = InterviewNovaSonic(
                 resume_text=self._resume_text,
@@ -365,39 +346,14 @@ class InterviewConnectionManager:
             await self.nova_client.start_session()
             logger.info("New Nova Sonic session started")
 
-            # Replay full conversation history from DB (no in-memory cap)
+            # Replay recent conversation history (trimmed to fit context limit)
             history = await self._load_history_from_db()
-            while history and history[0]["role"] != "USER":
-                history.pop(0)
-            for msg in history:
-                content_name = msg["contentName"]
-                role = msg["role"]
-                text = msg["text"]
-                await self.nova_client.send_event(json.dumps({
-                    "event": {"contentStart": {
-                        "promptName": self.nova_client.prompt_name,
-                        "contentName": content_name,
-                        "type": "TEXT",
-                        "interactive": False,
-                        "role": role,
-                        "textInputConfiguration": {"mediaType": "text/plain"},
-                    }}
-                }))
-                await self.nova_client.send_event(json.dumps({
-                    "event": {"textInput": {
-                        "promptName": self.nova_client.prompt_name,
-                        "contentName": content_name,
-                        "content": text,
-                    }}
-                }))
-                await self.nova_client.send_event(json.dumps({
-                    "event": {"contentEnd": {
-                        "promptName": self.nova_client.prompt_name,
-                        "contentName": content_name,
-                    }}
-                }))
+            if history:
+                await self._replay_history(history)
 
-            logger.info("Auto-reconnect complete — conversation history replayed")
+            # Re-open the persistent audio stream
+            await self.nova_client.open_audio_stream()
+            logger.info("Auto-reconnect complete — conversation history replayed, audio stream open")
 
             # Notify frontend reconnect succeeded
             if self.active_connection:
@@ -435,6 +391,18 @@ class InterviewConnectionManager:
                             self.nova_client.audio_queue.get(), timeout=0.1
                         )
                         if audio_data:
+                            # Sentinel pushed by _process_responses after the last
+                            # audio chunk for an AI turn.  Because it goes through the
+                            # same queue, it is guaranteed to arrive here only after
+                            # every binary audio chunk has been sent to the frontend.
+                            if audio_data == "__AI_AUDIO_DONE__":
+                                try:
+                                    done_event = json.dumps({"event": {"aiAudioDone": {}}})
+                                    await self.active_connection.send_text(done_event)
+                                except Exception:
+                                    pass
+                                continue
+
                             if self.nova_client.barge_in:
                                 continue
                             for i in range(0, len(audio_data), CHUNK_SIZE):
@@ -474,6 +442,15 @@ class InterviewConnectionManager:
                         )
                         if event_json:
                             event_data = json.loads(event_json)
+
+                            # On barge-in: discard the partial message and clear the
+                            # buffer. Do NOT save it — the AI will restart and deliver
+                            # the complete response, which gets saved on the next role
+                            # change. Saving the partial here creates duplicate DB rows
+                            # that confuse the AI when history is replayed on reconnect.
+                            if "event" in event_data and "bargeIn" in event_data["event"]:
+                                self.current_assistant_message = ""
+
                             if "event" in event_data and "textOutput" in event_data["event"]:
                                 text_content = event_data["event"]["textOutput"].get("content", "")
                                 role = event_data["event"]["textOutput"].get("role", "ASSISTANT")
@@ -636,30 +613,17 @@ async def interview_websocket(websocket: WebSocket, session_id: str, token: str 
                         event = data["event"]
                         if "textInput" in event:
                             user_text = event["textInput"].get("content", "")
-                            # Accumulate user text input
                             if manager.last_message_role and manager.last_message_role != "USER":
-                                # Role changed, save previous assistant message
                                 if manager.current_assistant_message.strip():
                                     await manager.save_message("ASSISTANT", manager.current_assistant_message.strip())
                                     manager.add_history("ASSISTANT", manager.current_assistant_message.strip())
                                     manager.current_assistant_message = ""
                             manager.current_user_message += user_text
                             manager.last_message_role = "USER"
-                    else:
-                        command = message["text"]
-                        if command == "start_audio":
-                            await manager.start_audio()
-                        elif command == "stop_audio":
-                            await manager.stop_audio()
-                        elif command == "end_interview":
-                            break
+                    elif message["text"] == "end_interview":
+                        break
                 except json.JSONDecodeError:
-                    command = message["text"]
-                    if command == "start_audio":
-                        await manager.start_audio()
-                    elif command == "stop_audio":
-                        await manager.stop_audio()
-                    elif command == "end_interview":
+                    if message["text"] == "end_interview":
                         break
     except WebSocketDisconnect:
         logger.info(f"WebSocket disconnected for session {session_id}")

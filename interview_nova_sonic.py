@@ -195,7 +195,8 @@ RULES:
         )
         self.is_active = True
 
-        # Session start
+        # Session start — with server-side turn detection so Nova Sonic
+        # handles endpointing instead of fragile client-side VAD.
         session_start = json.dumps({
             "event": {
                 "sessionStart": {
@@ -203,6 +204,9 @@ RULES:
                         "maxTokens": 1024,
                         "topP": 0.9,
                         "temperature": 0.7,
+                    },
+                    "turnDetectionConfiguration": {
+                        "endpointingSensitivity": "MEDIUM"
                     }
                 }
             }
@@ -269,7 +273,14 @@ RULES:
         # Start processing responses
         self.response = asyncio.create_task(self._process_responses())
 
-    async def start_audio_input(self):
+    async def open_audio_stream(self):
+        """Open the single persistent audio content container.
+
+        Per AWS docs, all audio frames share ONE container for the entire
+        session.  Call this once after all context (system prompt, history,
+        greeting trigger) has been sent.  Audio is then streamed continuously
+        via send_audio_chunk until the session ends.
+        """
         audio_content_start = json.dumps({
             "event": {
                 "contentStart": {
@@ -306,27 +317,41 @@ RULES:
         })
         await self.send_event(audio_event)
 
-    async def end_audio_input(self):
-        audio_content_end = json.dumps({
-            "event": {
-                "contentEnd": {
-                    "promptName": self.prompt_name,
-                    "contentName": self.audio_content_name,
-                }
-            }
-        })
-        await self.send_event(audio_content_end)
-
     async def end_session(self):
+        """Properly close audio stream → prompt → session in the correct order."""
         if not self.is_active:
             return
-        prompt_end = json.dumps({
-            "event": {"promptEnd": {"promptName": self.prompt_name}}
-        })
-        await self.send_event(prompt_end)
-        session_end = json.dumps({"event": {"sessionEnd": {}}})
-        await self.send_event(session_end)
-        await self.stream.input_stream.close()
+        try:
+            # 1. Close the audio content container
+            audio_content_end = json.dumps({
+                "event": {
+                    "contentEnd": {
+                        "promptName": self.prompt_name,
+                        "contentName": self.audio_content_name,
+                    }
+                }
+            })
+            await self.send_event(audio_content_end)
+        except Exception:
+            pass
+        try:
+            # 2. End the prompt
+            prompt_end = json.dumps({
+                "event": {"promptEnd": {"promptName": self.prompt_name}}
+            })
+            await self.send_event(prompt_end)
+        except Exception:
+            pass
+        try:
+            # 3. End the session
+            session_end = json.dumps({"event": {"sessionEnd": {}}})
+            await self.send_event(session_end)
+        except Exception:
+            pass
+        try:
+            await self.stream.input_stream.close()
+        except Exception:
+            pass
 
     async def _process_responses(self):
         """Process responses from Nova Sonic."""
@@ -340,12 +365,8 @@ RULES:
                     json_data = json.loads(response_data)
 
                     if "event" in json_data:
-                        # Only send non-audio events to frontend via JSON
-                        # Audio is sent via binary channel to save bandwidth
-                        if "audioOutput" not in json_data["event"]:
-                            await self.event_queue.put(json.dumps(json_data))
-
                         if "contentStart" in json_data["event"]:
+                            await self.event_queue.put(json.dumps(json_data))
                             content_start = json_data["event"]["contentStart"]
                             self.role = content_start.get("role")
                             # Reset barge-in when Nova Sonic starts a fresh ASSISTANT response.
@@ -364,14 +385,15 @@ RULES:
 
                         elif "textOutput" in json_data["event"]:
                             text = json_data["event"]["textOutput"]["content"]
-                            # Detect barge-in via JSON parsing (robust against whitespace variations)
+                            # Detect barge-in BEFORE forwarding to frontend so the raw
+                            # '{ "interrupted": true }' string is never queued or saved.
                             is_barge_in = False
                             try:
                                 parsed_text = json.loads(text)
                                 if isinstance(parsed_text, dict) and parsed_text.get("interrupted"):
                                     is_barge_in = True
                             except (json.JSONDecodeError, ValueError):
-                                # Also catch the legacy string format as a fallback
+                                # Fallback for legacy string format
                                 if "interrupted" in text and "true" in text:
                                     is_barge_in = True
 
@@ -388,6 +410,8 @@ RULES:
                                 await self.event_queue.put(json.dumps(barge_in_event))
                                 continue
 
+                            # Normal text — forward to frontend
+                            await self.event_queue.put(json.dumps(json_data))
                             if self.role == "ASSISTANT" and self.display_assistant_text:
                                 print(f"Interviewer: {text}")
                             elif self.role == "USER":
@@ -399,13 +423,29 @@ RULES:
                                 audio_bytes = base64.b64decode(audio_content)
                                 await self.audio_queue.put(audio_bytes)
 
+                        else:
+                            # Forward all other events (contentEnd, etc.) to frontend
+                            await self.event_queue.put(json.dumps(json_data))
+
+                            # When the AI finishes an audio response, push a sentinel
+                            # through the AUDIO queue so it arrives at the frontend
+                            # strictly AFTER every audio chunk.  process_audio_responses
+                            # converts this into an aiAudioDone text event.
+                            if "contentEnd" in json_data["event"]:
+                                ct = json_data["event"]["contentEnd"]
+                                if ct.get("type") == "AUDIO":
+                                    await self.audio_queue.put("__AI_AUDIO_DONE__")
+
         except Exception as e:
             from aws_sdk_bedrock_runtime.models import ModelTimeoutException, ValidationException
 
-            # Both ModelTimeoutException and a "Timed out waiting for audio bytes"
-            # ValidationException are recoverable — trigger transparent auto-reconnect.
+            # Recoverable errors that should trigger transparent auto-reconnect:
+            # - ModelTimeoutException (session idle too long)
+            # - "Timed out waiting for audio bytes" (audio stream stall)
+            # - "Chat history is over max limit" (too many replay messages)
             is_timeout = isinstance(e, ModelTimeoutException) or (
-                isinstance(e, ValidationException) and "Timed out" in str(e)
+                isinstance(e, ValidationException)
+                and ("Timed out" in str(e) or "over max limit" in str(e))
             )
 
             if is_timeout:
