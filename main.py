@@ -23,6 +23,29 @@ from routes.resume_routes import router as resume_router
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# Text injected as the auto-start kick-off so the AI introduces itself immediately.
+# We keep a reference to this exact string so process_events can filter it from
+# the saved transcript if Nova Sonic ever echoes the text input back as a textOutput.
+GREETING_TRIGGER_MARKER = "Please introduce yourself and begin the interview."
+
+# Phrases that indicate the AI has wrapped up the interview
+_INTERVIEW_COMPLETE_PHRASES = [
+    "interview is complete",
+    "interview is now complete",
+    "that concludes our interview",
+    "that's all the questions",
+    "those are all my questions",
+    "we've covered everything",
+    "thank you for your time today",
+    "best of luck",
+    "good luck with",
+    "this concludes",
+    "we're all done here",
+    "we are all done here",
+    "interview has come to an end",
+    "end of our interview",
+]
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -67,7 +90,7 @@ class InterviewConnectionManager:
         self.last_audio_chunk_time = 0
         self.audio_chunk_threshold = 0.1
         self.chat_history = []
-        self.max_history = 10
+        self.max_history = 30
         # Message accumulation buffers
         self.current_user_message = ""
         self.current_assistant_message = ""
@@ -87,6 +110,21 @@ class InterviewConnectionManager:
         self.chat_history.append({"role": role, "text": text, "contentName": content_name})
         if len(self.chat_history) > self.max_history:
             self.chat_history = self.chat_history[-self.max_history:]
+
+    async def _load_history_from_db(self) -> list[dict]:
+        """Load the full conversation history from DB for reconnect replay (no cap)."""
+        async with async_session() as db:
+            from sqlalchemy import select
+            result = await db.execute(
+                select(Message)
+                .where(Message.session_id == self.session_id)
+                .order_by(Message.timestamp.asc())
+            )
+            rows = result.scalars().all()
+            return [
+                {"role": m.role, "text": m.content, "contentName": str(uuid.uuid4())}
+                for m in rows
+            ]
 
     async def save_message(self, role: str, content: str):
         """Save a message to the database."""
@@ -129,13 +167,16 @@ class InterviewConnectionManager:
         self._company_name = company_name
         self._role_title = role_title
 
-        # Create Nova Sonic client with interview context and persona
+        # Create Nova Sonic client with interview context and persona.
+        # on_timeout sets _should_reconnect=True synchronously before is_active=False
+        # so process_events sees the flag before its inner while-loop condition fails.
         self.nova_client = InterviewNovaSonic(
             resume_text=resume_text,
             job_description=job_description,
             company_name=company_name,
             role_title=role_title,
             persona=persona,
+            on_timeout=lambda: setattr(self, "_should_reconnect", True),
         )
         self.interviewer_name = persona["name"]
 
@@ -153,8 +194,8 @@ class InterviewConnectionManager:
         await self.nova_client.start_session()
         logger.info("Interview Nova Sonic session started")
 
-        # Replay conversation history
-        history = self.chat_history.copy()
+        # Replay conversation history from DB (full history, no in-memory cap)
+        history = await self._load_history_from_db()
         while history and history[0]["role"] != "USER":
             history.pop(0)
         if history:
@@ -195,9 +236,12 @@ class InterviewConnectionManager:
                 })
                 await self.nova_client.send_event(content_end)
         
-        # Auto-start: Send initial greeting trigger to make AI introduce itself
-        # This makes the AI start talking immediately without waiting for user input
-        if not history:  # Only send greeting trigger if no conversation history
+        # Auto-start: inject a system-level kick-off text so the AI introduces itself
+        # immediately without waiting for the user to speak first.
+        # We use role=USER with interactive=False so Nova Sonic treats it as pre-seeded
+        # context. The GREETING_TRIGGER_MARKER lets process_events filter it out of the
+        # saved transcript and scoring data if Nova Sonic ever echoes it back.
+        if not history:
             greeting_content_name = str(uuid.uuid4())
             greeting_start = json.dumps({
                 "event": {
@@ -212,18 +256,18 @@ class InterviewConnectionManager:
                 }
             })
             await self.nova_client.send_event(greeting_start)
-            
+
             greeting_text = json.dumps({
                 "event": {
                     "textInput": {
                         "promptName": self.nova_client.prompt_name,
                         "contentName": greeting_content_name,
-                        "content": "Please introduce yourself and begin the interview.",
+                        "content": GREETING_TRIGGER_MARKER,
                     }
                 }
             })
             await self.nova_client.send_event(greeting_text)
-            
+
             greeting_end = json.dumps({
                 "event": {
                     "contentEnd": {
@@ -316,12 +360,13 @@ class InterviewConnectionManager:
                 company_name=self._company_name,
                 role_title=self._role_title,
                 persona=self._persona,
+                on_timeout=lambda: setattr(self, "_should_reconnect", True),
             )
             await self.nova_client.start_session()
             logger.info("New Nova Sonic session started")
 
-            # Replay conversation history so AI has full context
-            history = self.chat_history.copy()
+            # Replay full conversation history from DB (no in-memory cap)
+            history = await self._load_history_from_db()
             while history and history[0]["role"] != "USER":
                 history.pop(0)
             for msg in history:
@@ -371,6 +416,11 @@ class InterviewConnectionManager:
             return False
         finally:
             self._reconnect_done.set()
+
+    def _check_interview_complete(self, text: str) -> bool:
+        """Return True if the AI's accumulated response contains a wrap-up phrase."""
+        text_lower = text.lower()
+        return any(phrase in text_lower for phrase in _INTERVIEW_COMPLETE_PHRASES)
 
     async def process_audio_responses(self):
         """Drain audio queue and send binary chunks to frontend. Restarts after reconnect."""
@@ -428,19 +478,6 @@ class InterviewConnectionManager:
                                 text_content = event_data["event"]["textOutput"].get("content", "")
                                 role = event_data["event"]["textOutput"].get("role", "ASSISTANT")
 
-                                # Check for barge-in first
-                                if '{ "interrupted" : true }' in text_content:
-                                    logger.info("Barge-in detected")
-                                    self.nova_client.barge_in = True
-                                    barge_in_event = json.dumps({
-                                        "event": {"bargeIn": {"status": "interrupted"}}
-                                    })
-                                    await self.active_connection.send_text(barge_in_event)
-                                    # Clear current message on barge-in
-                                    if self.last_message_role == "ASSISTANT":
-                                        self.current_assistant_message = ""
-                                    continue
-
                                 # Detect role change - save accumulated message from previous speaker
                                 if self.last_message_role and self.last_message_role != role:
                                     if self.last_message_role == "USER" and self.current_user_message.strip():
@@ -452,11 +489,21 @@ class InterviewConnectionManager:
                                         self.add_history("ASSISTANT", self.current_assistant_message.strip())
                                         self.current_assistant_message = ""
 
-                                # Accumulate current chunk
+                                # Accumulate current chunk — skip the greeting trigger sentinel
                                 if role == "USER":
-                                    self.current_user_message += text_content
+                                    if GREETING_TRIGGER_MARKER not in text_content:
+                                        self.current_user_message += text_content
                                 else:  # ASSISTANT
                                     self.current_assistant_message += text_content
+                                    # Detect interview completion phrases in AI responses
+                                    if self._check_interview_complete(self.current_assistant_message):
+                                        complete_event = json.dumps({
+                                            "event": {"interviewComplete": {"message": "The interview has concluded."}}
+                                        })
+                                        try:
+                                            await self.active_connection.send_text(complete_event)
+                                        except Exception:
+                                            pass
 
                                 # Update last role
                                 self.last_message_role = role
@@ -480,7 +527,25 @@ class InterviewConnectionManager:
             except Exception as e:
                 logger.error(f"Event loop error: {e}")
 
-            # Inner loop exited. Reconnect if flagged.
+            # Inner loop exited (is_active=False or exception).
+            # Drain any remaining events to catch MODEL_TIMEOUT that arrived just as
+            # is_active was set to False (fixes the race condition).
+            if self.nova_client:
+                try:
+                    while not self.nova_client.event_queue.empty():
+                        remaining = self.nova_client.event_queue.get_nowait()
+                        remaining_data = json.loads(remaining)
+                        if (
+                            "event" in remaining_data
+                            and "error" in remaining_data["event"]
+                            and remaining_data["event"]["error"].get("code") == "MODEL_TIMEOUT"
+                        ):
+                            logger.info("MODEL_TIMEOUT found in queue drain — triggering auto-reconnect")
+                            self._should_reconnect = True
+                except Exception:
+                    pass
+
+            # Reconnect if flagged (set either by on_timeout callback or queue drain above).
             if self._should_reconnect:
                 success = await self._auto_reconnect()
                 if success:
@@ -501,12 +566,20 @@ def verify_ws_token(token: str) -> str | None:
         return None
 
 
+MAX_CONCURRENT_SESSIONS_PER_USER = 2
+
 @app.websocket("/ws/interview/{session_id}")
 async def interview_websocket(websocket: WebSocket, session_id: str, token: str = Query("")):
     # Authenticate
     user_id = verify_ws_token(token)
     if not user_id:
         await websocket.close(code=4001, reason="Unauthorized")
+        return
+
+    # Rate limit: prevent a single user from opening many concurrent AI sessions
+    user_active_count = sum(1 for mgr in active_interviews.values() if mgr.user_id == user_id)
+    if user_active_count >= MAX_CONCURRENT_SESSIONS_PER_USER:
+        await websocket.close(code=4029, reason="Too many active sessions")
         return
 
     # Verify session belongs to user

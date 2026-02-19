@@ -73,6 +73,7 @@ class InterviewNovaSonic:
         persona: dict | None = None,
         model_id: str = "amazon.nova-2-sonic-v1:0",
         region: str = "us-east-1",
+        on_timeout: callable = None,
     ):
         self.model_id = model_id
         self.region = region
@@ -94,6 +95,8 @@ class InterviewNovaSonic:
         self.role_title = role_title
         # Persona: randomly assigned if not provided
         self.persona = persona or pick_random_persona()
+        # Called synchronously when a MODEL_TIMEOUT is detected, before is_active=False
+        self.on_timeout = on_timeout
 
     def _initialize_client(self):
         config = Config(
@@ -361,7 +364,18 @@ RULES:
 
                         elif "textOutput" in json_data["event"]:
                             text = json_data["event"]["textOutput"]["content"]
-                            if '{ "interrupted" : true }' in text:
+                            # Detect barge-in via JSON parsing (robust against whitespace variations)
+                            is_barge_in = False
+                            try:
+                                parsed_text = json.loads(text)
+                                if isinstance(parsed_text, dict) and parsed_text.get("interrupted"):
+                                    is_barge_in = True
+                            except (json.JSONDecodeError, ValueError):
+                                # Also catch the legacy string format as a fallback
+                                if "interrupted" in text and "true" in text:
+                                    is_barge_in = True
+
+                            if is_barge_in:
                                 print("Barge-in detected")
                                 self.barge_in = True
                                 barge_in_event = {
@@ -386,19 +400,25 @@ RULES:
                                 await self.audio_queue.put(audio_bytes)
 
         except Exception as e:
-            from aws_sdk_bedrock_runtime.models import ModelTimeoutException
-            if isinstance(e, ModelTimeoutException):
-                print(f"Nova Sonic model timed out: {e}")
-                # Notify the frontend so the UI can show a helpful message
+            from aws_sdk_bedrock_runtime.models import ModelTimeoutException, ValidationException
+
+            # Both ModelTimeoutException and a "Timed out waiting for audio bytes"
+            # ValidationException are recoverable — trigger transparent auto-reconnect.
+            is_timeout = isinstance(e, ModelTimeoutException) or (
+                isinstance(e, ValidationException) and "Timed out" in str(e)
+            )
+
+            if is_timeout:
+                print(f"Nova Sonic session timed out (will reconnect): {e}")
+                # Signal the manager to reconnect BEFORE setting is_active=False so
+                # process_events doesn't exit its inner loop before seeing this flag.
+                if self.on_timeout:
+                    self.on_timeout()
                 timeout_event = json.dumps({
                     "event": {
                         "error": {
                             "code": "MODEL_TIMEOUT",
-                            "message": (
-                                "The AI took too long to process your response. "
-                                "This can happen after extended answers. "
-                                "Please start a new session to continue."
-                            ),
+                            "message": "Reconnecting session after timeout…",
                         }
                     }
                 })

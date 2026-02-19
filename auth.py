@@ -1,11 +1,24 @@
 import os
+import warnings
 from datetime import datetime, timedelta
 from jose import jwt, JWTError
 import bcrypt
 from fastapi import HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "interviewed-secret-key-change-in-production")
+_DEFAULT_SECRET = "interviewed-secret-key-change-in-production"
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", _DEFAULT_SECRET)
+
+if SECRET_KEY == _DEFAULT_SECRET:
+    warnings.warn(
+        "\n\n"
+        "  ⚠️  SECURITY WARNING: JWT_SECRET_KEY is not set.\n"
+        "  Using the default insecure key. Any attacker can forge tokens.\n"
+        "  Set JWT_SECRET_KEY in your .env file before deploying.\n",
+        RuntimeWarning,
+        stacklevel=1,
+    )
+
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24
 

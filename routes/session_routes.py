@@ -10,7 +10,7 @@ from datetime import datetime
 
 import boto3
 
-from database import get_db, Session as SessionModel, Message, SessionScore
+from database import get_db, Session as SessionModel, Message, SessionScore, User
 from models import (
     SessionCreate,
     SessionResponse,
@@ -143,7 +143,11 @@ async def get_progress(
                 pass
     total_practice_minutes = round(total_minutes)
 
-    # Current streak: consecutive days with at least one completed session (going backwards from today)
+    # Current streak: consecutive days with at least one completed session (going backwards from today).
+    # NOTE: completed_at is stored in UTC. date_type.today() also returns the server's UTC date.
+    # Users in UTC-negative timezones may appear to lose their streak early if they practice late
+    # in their local evening (which is already "tomorrow" in UTC). A future improvement would be
+    # to accept the user's timezone offset from the frontend and adjust accordingly.
     from datetime import date as date_type
     completed_dates = set()
     for s, _ in rows:
@@ -307,9 +311,10 @@ async def get_session_analytics(
         for m in msg_rows
     ]
 
-    # Count questions (ASSISTANT messages that end with ?)
+    # Count questions: any ASSISTANT message that contains at least one "?"
+    # (more robust than endswith — catches multi-sentence turns with a question inside)
     total_questions = sum(
-        1 for m in messages if m.role == "ASSISTANT" and m.content.strip().endswith("?")
+        1 for m in messages if m.role == "ASSISTANT" and "?" in m.content
     )
 
     # Calculate duration
@@ -344,6 +349,10 @@ async def get_session_analytics(
             ],
             created_at=str(score_row.created_at) if score_row.created_at else "",
         )
+        # Override with AI-counted questions if available (more accurate than heuristic)
+        ai_question_count = len(json.loads(score_row.question_scores or "[]"))
+        if ai_question_count > 0:
+            total_questions = ai_question_count
 
     return SessionAnalytics(
         session=session,
@@ -458,7 +467,7 @@ SCORING_TOOL_CONFIG = {
 }
 
 
-def _build_scoring_prompt(messages_data: list, job_description: str, role_title: str) -> str:
+def _build_scoring_prompt(messages_data: list, job_description: str, role_title: str, resume_text: str = "") -> str:
     """Build the user prompt for interview evaluation."""
     transcript_lines = []
     for role, content in messages_data:
@@ -466,18 +475,24 @@ def _build_scoring_prompt(messages_data: list, job_description: str, role_title:
         transcript_lines.append(f"{speaker}: {content}")
     transcript = "\n".join(transcript_lines)
 
+    resume_section = (
+        f"\n--- CANDIDATE RESUME ---\n{resume_text}\n--- END RESUME ---\n"
+        if resume_text
+        else ""
+    )
+
     return f"""Analyze the following practice interview transcript and evaluate the candidate's performance.
 
 Role: {role_title or 'Not specified'}
 Job Description: {job_description or 'Not specified'}
-
+{resume_section}
 --- TRANSCRIPT ---
 {transcript}
 --- END TRANSCRIPT ---
 
-Evaluate the candidate on communication, technical knowledge, problem solving, confidence, and relevance. Provide an overall score, specific strengths, areas for improvement, detailed feedback, and per-question scores.
+Evaluate the candidate on communication, technical knowledge, problem solving, confidence, and relevance to the job description and their own stated resume experience. Provide an overall score, specific strengths, areas for improvement, detailed feedback, and per-question scores.
 
-IMPORTANT: Use the full 1-10 scoring range. Do NOT give the same score for every question. Differentiate based on quality — strong, specific answers with examples should score higher (7-10) than vague or incomplete answers (1-5). Be honest and critical."""
+IMPORTANT: Use the full 1-10 scoring range. Do NOT give the same score for every question. Differentiate based on quality — strong, specific answers with examples should score higher (7-10) than vague or incomplete answers (1-5). Be honest and critical. When a candidate's answer contradicts or under-represents their resume experience, call it out."""
 
 
 def _call_nova_lite(prompt: str) -> dict:
@@ -515,53 +530,108 @@ def _call_nova_lite(prompt: str) -> dict:
 
 
 def _heuristic_fallback(messages_data: list) -> dict:
-    """Original heuristic scoring as a fallback."""
+    """Heuristic scoring used when the AI scoring call fails.
+
+    Scores use the full 1–10 range. Word count alone is NOT treated as quality;
+    we additionally weight vocabulary richness and structural markers.
+    """
     user_messages = [m[1] for m in messages_data if m[0] == "USER"]
     assistant_messages = [m[1] for m in messages_data if m[0] == "ASSISTANT"]
 
-    total_user_words = sum(len(m.split()) for m in user_messages)
-    avg_response_length = total_user_words / max(len(user_messages), 1)
+    if not user_messages:
+        return {
+            "overall_score": 1.0,
+            "communication_score": 1.0,
+            "technical_score": 1.0,
+            "problem_solving_score": 1.0,
+            "confidence_score": 1.0,
+            "relevance_score": 1.0,
+            "strengths": [],
+            "improvements": ["No candidate responses were recorded."],
+            "detailed_feedback": "No candidate responses were recorded in this session.",
+            "question_scores": [],
+        }
 
-    communication = min(10, max(3, avg_response_length / 5))
-    technical_keywords = ["algorithm", "system", "design", "implement", "optimize", "database", "api", "architecture", "scale", "performance", "complexity", "data structure"]
+    total_user_words = sum(len(m.split()) for m in user_messages)
+    avg_response_length = total_user_words / len(user_messages)
+
+    # Communication: penalise very short AND very long (rambling) answers
+    # Sweet spot is ~50–150 words; normalise to 1–10
+    if avg_response_length < 5:
+        communication = 1.0
+    elif avg_response_length < 20:
+        communication = 1.0 + (avg_response_length - 5) / 15 * 3  # 1–4
+    elif avg_response_length < 150:
+        communication = 4.0 + (avg_response_length - 20) / 130 * 5  # 4–9
+    else:
+        communication = max(5.0, 9.0 - (avg_response_length - 150) / 100)  # slight penalty for rambling
+
+    technical_keywords = [
+        "algorithm", "system", "design", "implement", "optimize", "database",
+        "api", "architecture", "scale", "performance", "complexity",
+        "data structure", "framework", "infrastructure", "pipeline", "latency",
+    ]
     tech_count = sum(1 for m in user_messages for k in technical_keywords if k in m.lower())
-    technical = min(10, max(3, 3 + tech_count * 0.8))
-    structure_keywords = ["first", "then", "because", "approach", "solution", "consider", "trade-off", "alternatively"]
+    technical = min(10.0, max(1.0, 2.0 + tech_count * 0.7))
+
+    structure_keywords = [
+        "first", "second", "third", "then", "finally", "because", "approach",
+        "solution", "consider", "trade-off", "alternatively", "in summary",
+        "to summarise", "for example", "such as", "specifically",
+    ]
     struct_count = sum(1 for m in user_messages for k in structure_keywords if k in m.lower())
-    problem_solving = min(10, max(3, 3 + struct_count * 0.7))
-    hedge_words = ["maybe", "i think", "probably", "not sure", "i guess", "kind of", "sort of"]
+    problem_solving = min(10.0, max(1.0, 2.0 + struct_count * 0.65))
+
+    hedge_words = ["maybe", "i think", "probably", "not sure", "i guess", "kind of", "sort of", "i'm not sure"]
     hedge_count = sum(1 for m in user_messages for k in hedge_words if k in m.lower())
-    confidence = min(10, max(3, 8 - hedge_count * 0.5))
-    questions = [m for m in assistant_messages if m.strip().endswith("?")]
-    relevance = min(10, max(3, 5 + min(len(user_messages), len(questions)) * 0.5))
+    confidence = min(10.0, max(1.0, 8.0 - hedge_count * 0.6))
+
+    questions = [m for m in assistant_messages if "?" in m]
+    answered_ratio = min(len(user_messages), len(questions)) / max(len(questions), 1)
+    relevance = min(10.0, max(1.0, 3.0 + answered_ratio * 6.0))
+
     overall = round((communication + technical + problem_solving + confidence + relevance) / 5, 1)
 
     strengths = []
     improvements = []
-    if avg_response_length > 20:
-        strengths.append("Provides detailed and thorough responses")
+    if avg_response_length >= 40:
+        strengths.append("Provides sufficiently detailed responses")
+    elif avg_response_length >= 15:
+        improvements.append("Try to elaborate more — aim for at least 40–80 words per answer with specific examples")
     else:
-        improvements.append("Try to elaborate more on your answers with specific examples")
-    if tech_count > 2:
+        improvements.append("Answers are very brief; use the STAR method (Situation, Task, Action, Result) to structure fuller responses")
+
+    if tech_count >= 4:
         strengths.append("Demonstrates strong technical vocabulary")
+    elif tech_count >= 2:
+        strengths.append("Shows some technical knowledge")
     else:
-        improvements.append("Incorporate more technical terminology relevant to the role")
-    if struct_count > 2:
-        strengths.append("Shows structured problem-solving approach")
+        improvements.append("Incorporate more technical terminology and specifics relevant to the role")
+
+    if struct_count >= 4:
+        strengths.append("Uses clear structure and logical flow in answers")
+    elif struct_count >= 2:
+        strengths.append("Shows some structural organisation in responses")
     else:
-        improvements.append("Structure your answers with a clear beginning, middle, and end")
-    if hedge_count < 2:
-        strengths.append("Projects confidence in responses")
+        improvements.append("Structure answers with clear signposting (e.g. 'First…', 'The approach I took was…')")
+
+    if hedge_count == 0:
+        strengths.append("Projects strong confidence — minimal hedging language")
+    elif hedge_count <= 2:
+        improvements.append("Reduce hedging phrases ('I think', 'maybe') to project more confidence")
     else:
-        improvements.append("Reduce hedging language to project more confidence")
-    if len(user_messages) >= len(questions) * 0.8:
-        strengths.append("Addresses most questions raised by the interviewer")
+        improvements.append("Excessive hedging detected — practice delivering answers with conviction")
+
+    if answered_ratio >= 0.9:
+        strengths.append("Addresses virtually all of the interviewer's questions")
+    elif answered_ratio >= 0.7:
+        improvements.append("A few questions appeared unanswered — make sure to address every question asked")
     else:
-        improvements.append("Make sure to address each question asked by the interviewer")
+        improvements.append("Several questions went unanswered; listen carefully and ensure you respond to each one")
 
     question_scores = []
     for i, (role, content) in enumerate(messages_data):
-        if role == "ASSISTANT" and content.strip().endswith("?"):
+        if role == "ASSISTANT" and "?" in content:
             user_response = ""
             for j in range(i + 1, len(messages_data)):
                 if messages_data[j][0] == "USER":
@@ -569,12 +639,24 @@ def _heuristic_fallback(messages_data: list) -> dict:
                     break
             if user_response:
                 words = len(user_response.split())
-                q_score = min(10, max(3, words / 4))
+                # Score out of 10 based on response length with a reasonable curve
+                if words < 5:
+                    q_score = 1.0
+                elif words < 20:
+                    q_score = 1.0 + (words - 5) / 15 * 3
+                elif words < 100:
+                    q_score = 4.0 + (words - 20) / 80 * 4
+                else:
+                    q_score = min(10.0, 8.0 + (words - 100) / 100)
                 question_scores.append({
                     "question": content,
                     "answer_summary": user_response[:200],
                     "score": round(q_score, 1),
-                    "feedback": "Good response" if q_score >= 6 else "Could be more detailed",
+                    "feedback": (
+                        "Strong, detailed response." if q_score >= 7
+                        else "Decent answer but could benefit from more depth and examples." if q_score >= 4
+                        else "Answer was too brief — expand with specific examples and context."
+                    ),
                 })
 
     return {
@@ -587,8 +669,10 @@ def _heuristic_fallback(messages_data: list) -> dict:
         "strengths": strengths,
         "improvements": improvements,
         "detailed_feedback": (
-            f"Interview session completed with {len(user_messages)} responses to {len(questions)} questions. "
-            f"Average response length: {int(avg_response_length)} words."
+            f"Session completed with {len(user_messages)} candidate responses to "
+            f"{len(questions)} interviewer questions. "
+            f"Average response length: {int(avg_response_length)} words. "
+            "(Note: this is an automated estimate — AI scoring was unavailable.)"
         ),
         "question_scores": question_scores,
     }
@@ -608,7 +692,7 @@ async def _generate_session_scores(db: AsyncSession, session_id: str):
     if not messages_data:
         return
 
-    # Get session context for the AI prompt
+    # Get session context and user resume for the AI prompt
     session_result = await db.execute(
         select(SessionModel).where(SessionModel.id == session_id)
     )
@@ -616,10 +700,18 @@ async def _generate_session_scores(db: AsyncSession, session_id: str):
     job_description = session_row.job_description if session_row else ""
     role_title = session_row.role_title if session_row else ""
 
+    resume_text = ""
+    if session_row and session_row.user_id:
+        user_result = await db.execute(
+            select(User).where(User.id == session_row.user_id)
+        )
+        user_row = user_result.scalar_one_or_none()
+        resume_text = (user_row.resume_text or "") if user_row else ""
+
     # Try AI scoring, fall back to heuristic
     scores = None
     try:
-        prompt = _build_scoring_prompt(messages_data, job_description, role_title)
+        prompt = _build_scoring_prompt(messages_data, job_description, role_title, resume_text)
         logger.info(f"Calling Amazon Nova Lite for interview scoring (session {session_id})")
         scores = await asyncio.to_thread(_call_nova_lite, prompt)
         logger.info(f"AI scoring completed for session {session_id}")
