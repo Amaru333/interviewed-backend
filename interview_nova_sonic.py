@@ -16,7 +16,7 @@ from smithy_aws_core.identity import AWSCredentialsIdentity
 INPUT_SAMPLE_RATE = 16000
 OUTPUT_SAMPLE_RATE = 24000
 CHANNELS = 1
-CHUNK_SIZE = 512
+CHUNK_SIZE = 4096
 
 # ─── Interviewer Personas ────────────────────────────────────
 # Each persona has a name, Nova Sonic voiceId, gender, and personality style.
@@ -337,11 +337,18 @@ RULES:
                     json_data = json.loads(response_data)
 
                     if "event" in json_data:
-                        await self.event_queue.put(json.dumps(json_data))
+                        # Only send non-audio events to frontend via JSON
+                        # Audio is sent via binary channel to save bandwidth
+                        if "audioOutput" not in json_data["event"]:
+                            await self.event_queue.put(json.dumps(json_data))
 
                         if "contentStart" in json_data["event"]:
                             content_start = json_data["event"]["contentStart"]
                             self.role = content_start.get("role")
+                            # Reset barge-in when Nova Sonic starts a fresh ASSISTANT response.
+                            # Without this, barge_in stays True forever and all audio is silenced.
+                            if self.role == "ASSISTANT":
+                                self.barge_in = False
                             if "additionalModelFields" in content_start:
                                 additional_fields = json.loads(
                                     content_start["additionalModelFields"]
@@ -379,7 +386,38 @@ RULES:
                                 await self.audio_queue.put(audio_bytes)
 
         except Exception as e:
-            print(f"Error processing responses: {e}")
-            if hasattr(e, "__traceback__"):
-                import traceback
-                traceback.print_exc()
+            from aws_sdk_bedrock_runtime.models import ModelTimeoutException
+            if isinstance(e, ModelTimeoutException):
+                print(f"Nova Sonic model timed out: {e}")
+                # Notify the frontend so the UI can show a helpful message
+                timeout_event = json.dumps({
+                    "event": {
+                        "error": {
+                            "code": "MODEL_TIMEOUT",
+                            "message": (
+                                "The AI took too long to process your response. "
+                                "This can happen after extended answers. "
+                                "Please start a new session to continue."
+                            ),
+                        }
+                    }
+                })
+                await self.event_queue.put(timeout_event)
+            else:
+                print(f"Error processing responses: {e}")
+                if hasattr(e, "__traceback__"):
+                    import traceback
+                    traceback.print_exc()
+                # Push a generic error so the frontend isn't left hanging
+                error_event = json.dumps({
+                    "event": {
+                        "error": {
+                            "code": "SESSION_ERROR",
+                            "message": "The interview session encountered an error. Please start a new session.",
+                        }
+                    }
+                })
+                await self.event_queue.put(error_event)
+            # Cleanly shut down all loops
+            self.is_active = False
+

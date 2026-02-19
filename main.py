@@ -72,6 +72,15 @@ class InterviewConnectionManager:
         self.current_user_message = ""
         self.current_assistant_message = ""
         self.last_message_role = None
+        # Session params stored for auto-reconnect
+        self._resume_text = ""
+        self._job_description = ""
+        self._company_name = ""
+        self._role_title = ""
+        self._persona: dict | None = None
+        # Reconnect coordination
+        self._reconnect_done = asyncio.Event()
+        self._should_reconnect = False
 
     def add_history(self, role: str, text: str):
         content_name = str(uuid.uuid4())
@@ -112,6 +121,13 @@ class InterviewConnectionManager:
 
         # Pick a random interviewer persona for this session
         persona = pick_random_persona()
+        self._persona = persona
+
+        # Store session params for auto-reconnect
+        self._resume_text = resume_text
+        self._job_description = job_description
+        self._company_name = company_name
+        self._role_title = role_title
 
         # Create Nova Sonic client with interview context and persona
         self.nova_client = InterviewNovaSonic(
@@ -268,89 +284,208 @@ class InterviewConnectionManager:
             except Exception as e:
                 logger.error(f"Error stopping audio: {e}")
 
-    async def process_audio_responses(self):
-        if not self.nova_client or not self.active_connection:
-            return
-        logger.info("Started processing audio responses")
+    async def _auto_reconnect(self) -> bool:
+        """Transparently restart Nova Sonic session after a timeout.
+        Replays conversation history so the AI has full context.
+        Returns True if reconnect succeeded.
+        """
+        logger.info("Auto-reconnecting Nova Sonic session after timeout...")
+        self._reconnect_done.clear()
         try:
-            while self.nova_client.is_active:
+            # Notify frontend of brief reconnect (non-fatal)
+            if self.active_connection:
                 try:
-                    audio_data = await asyncio.wait_for(
-                        self.nova_client.audio_queue.get(), timeout=0.1
-                    )
-                    if audio_data:
-                        if self.nova_client.barge_in:
-                            continue
-                        for i in range(0, len(audio_data), CHUNK_SIZE):
-                            if self.nova_client.barge_in:
-                                break
-                            chunk = audio_data[i : min(i + CHUNK_SIZE, len(audio_data))]
-                            await self.active_connection.send_bytes(chunk)
-                            await asyncio.sleep(0.001)
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error processing audio response: {e}")
-                    await asyncio.sleep(0.05)
+                    await self.active_connection.send_text(json.dumps({
+                        "event": {"reconnecting": {"message": "Reconnecting..."}}
+                    }))
+                except Exception:
+                    pass
+
+            # Close old stream gracefully
+            try:
+                await self.nova_client.stream.input_stream.close()
+            except Exception:
+                pass
+
+            self.audio_content_started = False
+
+            # Create a fresh Nova Sonic client with the same interview context
+            self.nova_client = InterviewNovaSonic(
+                resume_text=self._resume_text,
+                job_description=self._job_description,
+                company_name=self._company_name,
+                role_title=self._role_title,
+                persona=self._persona,
+            )
+            await self.nova_client.start_session()
+            logger.info("New Nova Sonic session started")
+
+            # Replay conversation history so AI has full context
+            history = self.chat_history.copy()
+            while history and history[0]["role"] != "USER":
+                history.pop(0)
+            for msg in history:
+                content_name = msg["contentName"]
+                role = msg["role"]
+                text = msg["text"]
+                await self.nova_client.send_event(json.dumps({
+                    "event": {"contentStart": {
+                        "promptName": self.nova_client.prompt_name,
+                        "contentName": content_name,
+                        "type": "TEXT",
+                        "interactive": False,
+                        "role": role,
+                        "textInputConfiguration": {"mediaType": "text/plain"},
+                    }}
+                }))
+                await self.nova_client.send_event(json.dumps({
+                    "event": {"textInput": {
+                        "promptName": self.nova_client.prompt_name,
+                        "contentName": content_name,
+                        "content": text,
+                    }}
+                }))
+                await self.nova_client.send_event(json.dumps({
+                    "event": {"contentEnd": {
+                        "promptName": self.nova_client.prompt_name,
+                        "contentName": content_name,
+                    }}
+                }))
+
+            logger.info("Auto-reconnect complete — conversation history replayed")
+
+            # Notify frontend reconnect succeeded
+            if self.active_connection:
+                try:
+                    await self.active_connection.send_text(json.dumps({
+                        "event": {"reconnected": {"status": "ok"}}
+                    }))
+                except Exception:
+                    pass
+
+            self._should_reconnect = False
+            return True
+
         except Exception as e:
-            logger.error(f"Audio response loop error: {e}")
+            logger.error(f"Auto-reconnect failed: {e}")
+            return False
+        finally:
+            self._reconnect_done.set()
+
+    async def process_audio_responses(self):
+        """Drain audio queue and send binary chunks to frontend. Restarts after reconnect."""
+        while True:
+            if not self.nova_client or not self.active_connection:
+                return
+            logger.info("Started processing audio responses")
+            try:
+                while self.nova_client.is_active:
+                    try:
+                        audio_data = await asyncio.wait_for(
+                            self.nova_client.audio_queue.get(), timeout=0.1
+                        )
+                        if audio_data:
+                            if self.nova_client.barge_in:
+                                continue
+                            for i in range(0, len(audio_data), CHUNK_SIZE):
+                                if self.nova_client.barge_in:
+                                    break
+                                chunk = audio_data[i : min(i + CHUNK_SIZE, len(audio_data))]
+                                await self.active_connection.send_bytes(chunk)
+                                await asyncio.sleep(0.001)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing audio response: {e}")
+                        await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.error(f"Audio response loop error: {e}")
+
+            # Inner loop exited. Wait for reconnect signal (max 20s) then re-enter.
+            try:
+                await asyncio.wait_for(self._reconnect_done.wait(), timeout=20.0)
+            except asyncio.TimeoutError:
+                break
+            if self.nova_client and self.nova_client.is_active:
+                continue  # Resume with new client
+            break
+
 
     async def process_events(self):
-        if not self.nova_client or not self.active_connection:
-            return
-        try:
-            while self.nova_client.is_active:
-                try:
-                    event_json = await asyncio.wait_for(
-                        self.nova_client.event_queue.get(), timeout=1.0
-                    )
-                    if event_json:
-                        event_data = json.loads(event_json)
-                        if "event" in event_data and "textOutput" in event_data["event"]:
-                            text_content = event_data["event"]["textOutput"].get("content", "")
-                            role = event_data["event"]["textOutput"].get("role", "ASSISTANT")
+        """Drain event queue and forward to frontend. Auto-reconnects on timeout."""
+        while True:
+            if not self.nova_client or not self.active_connection:
+                return
+            try:
+                while self.nova_client.is_active:
+                    try:
+                        event_json = await asyncio.wait_for(
+                            self.nova_client.event_queue.get(), timeout=1.0
+                        )
+                        if event_json:
+                            event_data = json.loads(event_json)
+                            if "event" in event_data and "textOutput" in event_data["event"]:
+                                text_content = event_data["event"]["textOutput"].get("content", "")
+                                role = event_data["event"]["textOutput"].get("role", "ASSISTANT")
 
-                            # Check for barge-in first
-                            if '{ "interrupted" : true }' in text_content:
-                                logger.info("Barge-in detected")
-                                self.nova_client.barge_in = True
-                                barge_in_event = json.dumps({
-                                    "event": {"bargeIn": {"status": "interrupted"}}
-                                })
-                                await self.active_connection.send_text(barge_in_event)
-                                # Clear current message on barge-in
-                                if self.last_message_role == "ASSISTANT":
-                                    self.current_assistant_message = ""
-                                continue
+                                # Check for barge-in first
+                                if '{ "interrupted" : true }' in text_content:
+                                    logger.info("Barge-in detected")
+                                    self.nova_client.barge_in = True
+                                    barge_in_event = json.dumps({
+                                        "event": {"bargeIn": {"status": "interrupted"}}
+                                    })
+                                    await self.active_connection.send_text(barge_in_event)
+                                    # Clear current message on barge-in
+                                    if self.last_message_role == "ASSISTANT":
+                                        self.current_assistant_message = ""
+                                    continue
 
-                            # Detect role change - save accumulated message from previous speaker
-                            if self.last_message_role and self.last_message_role != role:
-                                if self.last_message_role == "USER" and self.current_user_message.strip():
-                                    await self.save_message("USER", self.current_user_message.strip())
-                                    self.add_history("USER", self.current_user_message.strip())
-                                    self.current_user_message = ""
-                                elif self.last_message_role == "ASSISTANT" and self.current_assistant_message.strip():
-                                    await self.save_message("ASSISTANT", self.current_assistant_message.strip())
-                                    self.add_history("ASSISTANT", self.current_assistant_message.strip())
-                                    self.current_assistant_message = ""
+                                # Detect role change - save accumulated message from previous speaker
+                                if self.last_message_role and self.last_message_role != role:
+                                    if self.last_message_role == "USER" and self.current_user_message.strip():
+                                        await self.save_message("USER", self.current_user_message.strip())
+                                        self.add_history("USER", self.current_user_message.strip())
+                                        self.current_user_message = ""
+                                    elif self.last_message_role == "ASSISTANT" and self.current_assistant_message.strip():
+                                        await self.save_message("ASSISTANT", self.current_assistant_message.strip())
+                                        self.add_history("ASSISTANT", self.current_assistant_message.strip())
+                                        self.current_assistant_message = ""
 
-                            # Accumulate current chunk
-                            if role == "USER":
-                                self.current_user_message += text_content
-                            else:  # ASSISTANT
-                                self.current_assistant_message += text_content
+                                # Accumulate current chunk
+                                if role == "USER":
+                                    self.current_user_message += text_content
+                                else:  # ASSISTANT
+                                    self.current_assistant_message += text_content
 
-                            # Update last role
-                            self.last_message_role = role
+                                # Update last role
+                                self.last_message_role = role
 
-                        await self.active_connection.send_text(event_json)
-                except asyncio.TimeoutError:
-                    continue
-                except Exception as e:
-                    logger.error(f"Error processing event: {e}")
-                    await asyncio.sleep(0.05)
-        except Exception as e:
-            logger.error(f"Event loop error: {e}")
+                            # Check if this is a timeout error event — trigger reconnect
+                            if (
+                                "event" in event_data
+                                and "error" in event_data["event"]
+                                and event_data["event"]["error"].get("code") == "MODEL_TIMEOUT"
+                            ):
+                                logger.info("MODEL_TIMEOUT detected — triggering auto-reconnect")
+                                self._should_reconnect = True
+                                break  # Break inner loop to trigger reconnect
+
+                            await self.active_connection.send_text(event_json)
+                    except asyncio.TimeoutError:
+                        continue
+                    except Exception as e:
+                        logger.error(f"Error processing event: {e}")
+                        await asyncio.sleep(0.05)
+            except Exception as e:
+                logger.error(f"Event loop error: {e}")
+
+            # Inner loop exited. Reconnect if flagged.
+            if self._should_reconnect:
+                success = await self._auto_reconnect()
+                if success:
+                    continue  # Re-enter outer loop with new nova_client
+            break
 
 
 # Active interview managers
