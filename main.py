@@ -112,7 +112,7 @@ class InterviewConnectionManager:
     # Nova Sonic's text-history context window is limited.  Replaying too many
     # messages causes "Chat history is over max limit".  We keep only the most
     # recent turns and ensure the list starts with a USER message (required).
-    MAX_REPLAY_MESSAGES = 6
+    MAX_REPLAY_MESSAGES = 4
 
     async def _load_history_from_db(self) -> list[dict]:
         """Load conversation history from DB, trimmed to fit Nova Sonic's limit."""
@@ -135,11 +135,11 @@ class InterviewConnectionManager:
             while all_msgs and all_msgs[0]["role"] != "USER":
                 all_msgs.pop(0)
             
-            # Truncate any single message to 1500 characters to prevent
+            # Truncate any single message to 800 characters to prevent
             # corrupted/repeating sessions from permanently maxing out AWS context window
             for msg in all_msgs:
-                if len(msg["text"]) > 1500:
-                    msg["text"] = msg["text"][-1500:]
+                if len(msg["text"]) > 800:
+                    msg["text"] = msg["text"][-800:]
 
             return all_msgs
 
@@ -463,6 +463,13 @@ class InterviewConnectionManager:
                                 # We received text from the AI - reset circuit breaker
                                 self._consecutive_reconnect_failures = 0
                                 text_content = event_data["event"]["textOutput"].get("content", "")
+                                
+                                # If this text block is just the raw barge-in interrupt signal,
+                                # immediately discard it and flush the aborted buffer so it isn't saved.
+                                if '"interrupted":' in text_content and 'true' in text_content.lower():
+                                    self.current_assistant_message = ""
+                                    continue
+
                                 role = event_data["event"]["textOutput"].get("role", "ASSISTANT")
 
                                 # Detect role change - save accumulated message from previous speaker
@@ -502,9 +509,15 @@ class InterviewConnectionManager:
                                 and event_data["event"]["error"].get("code") == "MODEL_TIMEOUT"
                             ):
                                 logger.info("MODEL_TIMEOUT detected — triggering auto-reconnect")
-                                # Clear active buffers so partial text isn't duplicated
-                                self.current_assistant_message = ""
-                                self.current_user_message = ""
+                                # Save active buffers to DB so the previous AI response isn't lost/repeated on reconnect
+                                if self.current_user_message.strip():
+                                    await self.save_message("USER", self.current_user_message.strip())
+                                    self.add_history("USER", self.current_user_message.strip())
+                                    self.current_user_message = ""
+                                if self.current_assistant_message.strip():
+                                    await self.save_message("ASSISTANT", self.current_assistant_message.strip())
+                                    self.add_history("ASSISTANT", self.current_assistant_message.strip())
+                                    self.current_assistant_message = ""
                                 
                                 self._consecutive_reconnect_failures += 1
                                 if self._consecutive_reconnect_failures > 2:
@@ -550,9 +563,15 @@ class InterviewConnectionManager:
                             and remaining_data["event"]["error"].get("code") == "MODEL_TIMEOUT"
                         ):
                             logger.info("MODEL_TIMEOUT found in queue drain — triggering auto-reconnect")
-                            # Clear active buffers so partial text isn't duplicated
-                            self.current_assistant_message = ""
-                            self.current_user_message = ""
+                            # Save active buffers to DB so the previous AI response isn't lost/repeated on reconnect
+                            if self.current_user_message.strip():
+                                await self.save_message("USER", self.current_user_message.strip())
+                                self.add_history("USER", self.current_user_message.strip())
+                                self.current_user_message = ""
+                            if self.current_assistant_message.strip():
+                                await self.save_message("ASSISTANT", self.current_assistant_message.strip())
+                                self.add_history("ASSISTANT", self.current_assistant_message.strip())
+                                self.current_assistant_message = ""
                             self._consecutive_reconnect_failures += 1
                             if self._consecutive_reconnect_failures <= 2:
                                 self._should_reconnect = True
