@@ -101,6 +101,7 @@ class InterviewConnectionManager:
         # Reconnect coordination
         self._reconnect_done = asyncio.Event()
         self._should_reconnect = False
+        self._consecutive_reconnect_failures = 0
 
     def add_history(self, role: str, text: str):
         content_name = str(uuid.uuid4())
@@ -111,7 +112,7 @@ class InterviewConnectionManager:
     # Nova Sonic's text-history context window is limited.  Replaying too many
     # messages causes "Chat history is over max limit".  We keep only the most
     # recent turns and ensure the list starts with a USER message (required).
-    MAX_REPLAY_MESSAGES = 16
+    MAX_REPLAY_MESSAGES = 6
 
     async def _load_history_from_db(self) -> list[dict]:
         """Load conversation history from DB, trimmed to fit Nova Sonic's limit."""
@@ -133,6 +134,13 @@ class InterviewConnectionManager:
             # History must start with a USER message per Nova Sonic docs
             while all_msgs and all_msgs[0]["role"] != "USER":
                 all_msgs.pop(0)
+            
+            # Truncate any single message to 1500 characters to prevent
+            # corrupted/repeating sessions from permanently maxing out AWS context window
+            for msg in all_msgs:
+                if len(msg["text"]) > 1500:
+                    msg["text"] = msg["text"][-1500:]
+
             return all_msgs
 
     async def _replay_history(self, history: list[dict]):
@@ -452,6 +460,8 @@ class InterviewConnectionManager:
                                 self.current_assistant_message = ""
 
                             if "event" in event_data and "textOutput" in event_data["event"]:
+                                # We received text from the AI - reset circuit breaker
+                                self._consecutive_reconnect_failures = 0
                                 text_content = event_data["event"]["textOutput"].get("content", "")
                                 role = event_data["event"]["textOutput"].get("role", "ASSISTANT")
 
@@ -492,8 +502,30 @@ class InterviewConnectionManager:
                                 and event_data["event"]["error"].get("code") == "MODEL_TIMEOUT"
                             ):
                                 logger.info("MODEL_TIMEOUT detected — triggering auto-reconnect")
-                                self._should_reconnect = True
-                                break  # Break inner loop to trigger reconnect
+                                # Clear active buffers so partial text isn't duplicated
+                                self.current_assistant_message = ""
+                                self.current_user_message = ""
+                                
+                                self._consecutive_reconnect_failures += 1
+                                if self._consecutive_reconnect_failures > 2:
+                                    logger.error("Auto-reconnect circuit breaker tripped (3 consecutive failures).")
+                                    # Fall through to standard error handling to end session cleanly
+                                    error_event = json.dumps({
+                                        "event": {
+                                            "error": {
+                                                "code": "SESSION_ERROR",
+                                                "message": "The connection to the AI was lost permanently. Please refresh and try again.",
+                                            }
+                                        }
+                                    })
+                                    try:
+                                        await self.active_connection.send_text(error_event)
+                                    except Exception:
+                                        pass
+                                    self._should_reconnect = False
+                                else:
+                                    self._should_reconnect = True
+                                break  # Break inner loop to trigger reconnect / shutdown
 
                             await self.active_connection.send_text(event_json)
                     except asyncio.TimeoutError:
@@ -518,7 +550,12 @@ class InterviewConnectionManager:
                             and remaining_data["event"]["error"].get("code") == "MODEL_TIMEOUT"
                         ):
                             logger.info("MODEL_TIMEOUT found in queue drain — triggering auto-reconnect")
-                            self._should_reconnect = True
+                            # Clear active buffers so partial text isn't duplicated
+                            self.current_assistant_message = ""
+                            self.current_user_message = ""
+                            self._consecutive_reconnect_failures += 1
+                            if self._consecutive_reconnect_failures <= 2:
+                                self._should_reconnect = True
                 except Exception:
                     pass
 

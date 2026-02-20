@@ -86,6 +86,7 @@ class InterviewNovaSonic:
         self.audio_content_name = str(uuid.uuid4())
         self.audio_queue = asyncio.Queue()
         self.event_queue = asyncio.Queue()
+        self.is_audio_ready = False
         self.role = None
         self.display_assistant_text = False
         self.barge_in = False
@@ -301,9 +302,10 @@ RULES:
             }
         })
         await self.send_event(audio_content_start)
+        self.is_audio_ready = True
 
     async def send_audio_chunk(self, audio_bytes):
-        if not self.is_active:
+        if not self.is_active or not self.is_audio_ready:
             return
         blob = base64.b64encode(audio_bytes)
         audio_event = json.dumps({
@@ -439,13 +441,17 @@ RULES:
         except Exception as e:
             from aws_sdk_bedrock_runtime.models import ModelTimeoutException, ValidationException
 
+            e_str = str(e).lower()
             # Recoverable errors that should trigger transparent auto-reconnect:
             # - ModelTimeoutException (session idle too long)
             # - "Timed out waiting for audio bytes" (audio stream stall)
             # - "Chat history is over max limit" (too many replay messages)
-            is_timeout = isinstance(e, ModelTimeoutException) or (
-                isinstance(e, ValidationException)
-                and ("Timed out" in str(e) or "over max limit" in str(e))
+            # - General stream disconnects ("stream", "closed", "timeout", "eof", "rst_stream")
+            is_timeout = (
+                isinstance(e, ModelTimeoutException)
+                or (isinstance(e, ValidationException) and ("timed out" in e_str or "over max limit" in e_str))
+                or isinstance(e, (TimeoutError, EOFError, ConnectionError))
+                or any(kw in e_str for kw in ["timeout", "timed out", "closed", "eof", "stream", "rst_stream", "broken pipe"])
             )
 
             if is_timeout:
