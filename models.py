@@ -56,6 +56,12 @@ class SessionResponse(BaseModel):
 
 class SessionListResponse(BaseModel):
     sessions: List[SessionResponse]
+    total: int
+    page: int
+    pages: int
+    global_total: int
+    global_active: int
+    global_completed: int
 
 
 # ─── Message Models ─────────────────────────────────────────

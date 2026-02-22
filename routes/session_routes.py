@@ -183,20 +183,67 @@ async def get_progress(
     }
 
 
+from sqlalchemy import or_, func
+
 @router.get("/", response_model=SessionListResponse)
 async def list_sessions(
+    page: int = 1,
+    limit: int = 10,
+    search: str = None,
+    status_filter: str = "all",
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(
-        select(SessionModel)
-        .where(SessionModel.user_id == user_id)
-        .order_by(SessionModel.created_at.desc())
+    # 1. Compute Global Stats for the user
+    global_result = await db.execute(
+        select(SessionModel.status).where(SessionModel.user_id == user_id)
     )
+    statuses = global_result.scalars().all()
+    global_total = len(statuses)
+    global_completed = sum(1 for s in statuses if s == "completed")
+    global_active = sum(1 for s in statuses if s != "completed")  # 'pending', 'active', etc.
+
+    # 2. Build Query
+    query = select(SessionModel).where(SessionModel.user_id == user_id)
+
+    if status_filter == "completed":
+        query = query.where(SessionModel.status == "completed")
+    elif status_filter == "active":
+        query = query.where(SessionModel.status != "completed")
+
+    if search:
+        search_term = f"%{search}%"
+        query = query.where(
+            or_(
+                SessionModel.name.ilike(search_term),
+                SessionModel.role_title.ilike(search_term),
+                SessionModel.company_name.ilike(search_term)
+            )
+        )
+
+    # 3. Get total filtered count
+    count_query = select(func.count()).select_from(query.subquery())
+    total_matches = await db.scalar(count_query)
+
+    # 4. Apply Pagination & Order
+    query = query.order_by(SessionModel.created_at.desc())
+    offset = (page - 1) * limit
+    query = query.offset(offset).limit(limit)
+
+    result = await db.execute(query)
     rows = result.scalars().all()
-    return SessionListResponse(sessions=[_session_to_response(s) for s in rows])
 
+    pages = max(1, (total_matches + limit - 1) // limit)
 
+    return SessionListResponse(
+        sessions=[_session_to_response(s) for s in rows],
+        total=total_matches,
+        page=page,
+        pages=pages,
+        global_total=global_total,
+        global_active=global_active,
+        global_completed=global_completed
+    )
 
 @router.get("/{session_id}", response_model=SessionResponse)
 async def get_session(
