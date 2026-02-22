@@ -38,6 +38,7 @@ def _session_to_response(s: SessionModel) -> SessionResponse:
         role_title=s.role_title or "",
         interviewer_name=s.interviewer_name or "",
         interviewer_voice=s.interviewer_voice or "",
+        interview_type=getattr(s, "interview_type", "solo") or "solo",
         status=s.status,
         created_at=str(s.created_at) if s.created_at else "",
         completed_at=str(s.completed_at) if s.completed_at else None,
@@ -60,6 +61,7 @@ async def create_session(
         job_description=data.job_description,
         company_name=data.company_name or "",
         role_title=data.role_title or "",
+        interview_type=data.interview_type or "solo",
         status="pending",
         created_at=now,
     )
@@ -73,6 +75,7 @@ async def create_session(
         job_description=data.job_description,
         company_name=data.company_name or "",
         role_title=data.role_title or "",
+        interview_type=data.interview_type or "solo",
         status="pending",
         created_at=now.isoformat(),
     )

@@ -36,6 +36,14 @@ INTERVIEWER_PERSONAS = [
     {"name": "Olivia", "voice": "olivia",   "gender": "female", "style": "friendly and encouraging"},
 ]
 
+# ─── Panel Personas (fixed trio for panel interviews) ────────────
+# Each has a distinct voice so the user hears a real difference.
+PANEL_PERSONAS = [
+    {"name": "Sarah",  "role": "Engineering Manager", "voice": "tiffany", "gender": "female", "style": "direct, technical, focused on system design and architecture"},
+    {"name": "Alex",   "role": "Product Manager",     "voice": "matthew", "gender": "male",   "style": "curious, user-focused, asks about impact and communication"},
+    {"name": "Jordan", "role": "Junior Developer",    "voice": "amy",     "gender": "female", "style": "casual, practical, asks about implementation details and debugging"},
+]
+
 
 def pick_random_persona() -> dict:
     """Select a random interviewer persona."""
@@ -71,6 +79,9 @@ class InterviewNovaSonic:
         company_name: str = "",
         role_title: str = "",
         persona: dict | None = None,
+        interview_type: str = "solo",
+        panelist_index: int = 0,
+        panel_total: int = 1,
         model_id: str = "amazon.nova-2-sonic-v1:0",
         region: str = "us-east-1",
         on_timeout: callable = None,
@@ -94,6 +105,9 @@ class InterviewNovaSonic:
         self.job_description = job_description
         self.company_name = company_name
         self.role_title = role_title
+        self.interview_type = interview_type
+        self.panelist_index = panelist_index
+        self.panel_total = panel_total
         # Persona: randomly assigned if not provided
         self.persona = persona or pick_random_persona()
         # Called synchronously when a MODEL_TIMEOUT is detected, before is_active=False
@@ -186,6 +200,55 @@ RULES:
 
         return prompt
 
+    def _build_panel_system_prompt(self) -> str:
+        """Build a per-panelist system prompt. Each panelist is a separate agent
+        with its own Nova Sonic session and voice."""
+        role_info = self.role_title or "the position"
+        company_info = f" at {self.company_name}" if self.company_name else ""
+        name = self.persona["name"]
+        role = self.persona.get("role", "Interviewer")
+        style = self.persona.get("style", "professional")
+
+        # Build awareness of other panelists
+        others = [p for p in PANEL_PERSONAS if p["name"] != name]
+        others_desc = ", ".join(f"{p['name']} ({p['role']})" for p in others)
+
+        is_first = self.panelist_index == 0
+        is_last = self.panelist_index == self.panel_total - 1
+
+        if is_first:
+            opening = f"""Welcome the candidate warmly. Introduce yourself as {name}, the {role}.
+Briefly mention the other panelists ({others_desc}) will join later.
+Then start asking your questions."""
+        else:
+            opening = f"""Introduce yourself briefly as {name}, the {role}.
+The candidate has already been speaking with the other panelists. Review the conversation history and react to what was discussed before asking your questions."""
+
+        if is_last:
+            closing = "After the candidate answers your questions, wrap up the entire interview. Thank them warmly and let them know the interview is complete."
+        else:
+            next_panelist = PANEL_PERSONAS[self.panelist_index + 1]
+            closing = f"After the candidate answers your questions, say goodbye and let them know {next_panelist['name']} will take over next."
+
+        prompt = f"""You are {name}, a {role}, interviewing a candidate for {role_info}{company_info}.
+
+Your personality: {style}. Let that come through naturally.
+
+{opening}
+
+RULES:
+- Ask exactly 2 questions relevant to your expertise
+- Keep responses SHORT: 1-2 sentences, then your question
+- React naturally to the candidate's answers
+- {closing}
+- Stay in character as a human interviewer, never mention AI
+- Sound natural and conversational
+
+Job: {self.job_description[:500] if self.job_description else 'General'}
+Resume: {self.resume_text[:500] if self.resume_text else 'Not provided'}"""
+
+        return prompt
+
     async def start_session(self):
         """Start a new interview session."""
         if not self.client:
@@ -249,7 +312,10 @@ RULES:
         })
         await self.send_event(content_start)
 
-        system_prompt = self._build_system_prompt()
+        if self.interview_type == "panel":
+            system_prompt = self._build_panel_system_prompt()
+        else:
+            system_prompt = self._build_system_prompt()
         text_input = json.dumps({
             "event": {
                 "textInput": {

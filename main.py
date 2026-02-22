@@ -6,6 +6,7 @@ import logging
 import uuid
 import json
 import time
+import re
 from datetime import datetime
 from jose import jwt, JWTError
 from dotenv import load_dotenv
@@ -14,7 +15,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from database import init_db, async_session, Session as SessionModel, User, Message
-from interview_nova_sonic import InterviewNovaSonic, pick_random_persona, CHUNK_SIZE
+from interview_nova_sonic import InterviewNovaSonic, pick_random_persona, PANEL_PERSONAS, CHUNK_SIZE
 from auth import SECRET_KEY, ALGORITHM
 from routes.auth_routes import router as auth_router
 from routes.session_routes import router as session_router
@@ -98,10 +99,20 @@ class InterviewConnectionManager:
         self._company_name = ""
         self._role_title = ""
         self._persona: dict | None = None
+        self._interview_type: str = "solo"
         # Reconnect coordination
         self._reconnect_done = asyncio.Event()
         self._should_reconnect = False
         self._consecutive_reconnect_failures = 0
+        # Panel tracking
+        self._active_panelist: str | None = None
+        self._panel_names: set[str] = set()
+        # Panel orchestration (multi-agent rotation)
+        self._panel_rotation: list[dict] = []  # list of panelist persona dicts
+        self._panel_index: int = 0
+        self._panel_user_responses: int = 0  # user answers for current panelist
+        self._questions_per_panelist: int = 2
+        self._switching_panelist: bool = False
 
     def add_history(self, role: str, text: str):
         content_name = str(uuid.uuid4())
@@ -143,12 +154,37 @@ class InterviewConnectionManager:
 
             return all_msgs
 
+    # Maximum bytes per single history message (matches AWS reference pattern)
+    _MAX_SINGLE_MSG_BYTES = 1024
+    _MAX_HISTORY_BYTES = 40960  # ~40KB total history cap
+
     async def _replay_history(self, history: list[dict]):
-        """Send conversation history to Nova Sonic as non-interactive text context."""
+        """Send conversation history to Nova Sonic as non-interactive text context.
+
+        Following the resume-conversation reference pattern:
+        - Each message is a separate contentStart/textInput/contentEnd triplet
+        - role is set in contentStart, interactive=false
+        - Messages are truncated to _MAX_SINGLE_MSG_BYTES
+        - Total history is capped at _MAX_HISTORY_BYTES
+        """
+        total_bytes = 0
         for msg in history:
             content_name = msg["contentName"]
             role = msg["role"]
             text = msg["text"]
+
+            # Truncate individual messages that exceed byte limit
+            text_bytes = text.encode('utf-8')
+            if len(text_bytes) > self._MAX_SINGLE_MSG_BYTES:
+                text = text_bytes[:self._MAX_SINGLE_MSG_BYTES].decode('utf-8', errors='ignore') + '... [truncated]'
+
+            # Check total history size cap
+            msg_size = len(text.encode('utf-8')) + len(role.encode('utf-8'))
+            if total_bytes + msg_size > self._MAX_HISTORY_BYTES:
+                logger.info(f"History replay capped at {total_bytes} bytes ({len(history)} messages)")
+                break
+            total_bytes += msg_size
+
             await self.nova_client.send_event(json.dumps({
                 "event": {"contentStart": {
                     "promptName": self.nova_client.prompt_name,
@@ -172,6 +208,7 @@ class InterviewConnectionManager:
                     "contentName": content_name,
                 }}
             }))
+            await asyncio.sleep(0.01)  # Small delay between history blocks
 
     async def save_message(self, role: str, content: str):
         """Save a message to the database."""
@@ -208,6 +245,29 @@ class InterviewConnectionManager:
         persona = pick_random_persona()
         self._persona = persona
 
+        # Determine interview type
+        interview_type = "solo"
+        async with async_session() as db:
+            from sqlalchemy import select
+            result = await db.execute(
+                select(SessionModel).where(SessionModel.id == self.session_id)
+            )
+            sess = result.scalar_one_or_none()
+            if sess:
+                interview_type = getattr(sess, "interview_type", "solo") or "solo"
+        self._interview_type = interview_type
+
+        # For panel mode, set up multi-agent rotation
+        if self._interview_type == "panel":
+            self._panel_names = {p["name"] for p in PANEL_PERSONAS}
+            self._panel_rotation = list(PANEL_PERSONAS)
+            self._panel_index = 0
+            self._panel_user_responses = 0
+            # Use the first panelist's persona (with their distinct voice)
+            persona = self._panel_rotation[0]
+            self._persona = persona
+            self._active_panelist = persona["name"]
+
         # Store session params for auto-reconnect
         self._resume_text = resume_text
         self._job_description = job_description
@@ -223,6 +283,9 @@ class InterviewConnectionManager:
             company_name=company_name,
             role_title=role_title,
             persona=persona,
+            interview_type=interview_type,
+            panelist_index=self._panel_index if interview_type == "panel" else 0,
+            panel_total=len(self._panel_rotation) if interview_type == "panel" else 1,
             on_timeout=lambda: setattr(self, "_should_reconnect", True),
         )
         self.interviewer_name = persona["name"]
@@ -246,11 +309,9 @@ class InterviewConnectionManager:
         if history:
             await self._replay_history(history)
         
-        # Auto-start: inject a system-level kick-off text so the AI introduces itself
-        # immediately without waiting for the user to speak first.
-        # We use role=USER with interactive=False so Nova Sonic treats it as pre-seeded
-        # context. The GREETING_TRIGGER_MARKER lets process_events filter it out of the
-        # saved transcript and scoring data if Nova Sonic ever echoes it back.
+        # Auto-start: inject a text input to trigger the AI to introduce itself.
+        # Per the speaks-first reference pattern, we use interactive=True so Nova Sonic
+        # treats this as real user input and generates a response to it.
         if not history:
             greeting_content_name = str(uuid.uuid4())
             greeting_start = json.dumps({
@@ -259,7 +320,7 @@ class InterviewConnectionManager:
                         "promptName": self.nova_client.prompt_name,
                         "contentName": greeting_content_name,
                         "type": "TEXT",
-                        "interactive": False,
+                        "interactive": True,
                         "role": "USER",
                         "textInputConfiguration": {"mediaType": "text/plain"},
                     }
@@ -353,6 +414,9 @@ class InterviewConnectionManager:
                 company_name=self._company_name,
                 role_title=self._role_title,
                 persona=self._persona,
+                interview_type=self._interview_type,
+                panelist_index=self._panel_index if self._interview_type == "panel" else 0,
+                panel_total=len(self._panel_rotation) if self._interview_type == "panel" else 1,
                 on_timeout=lambda: setattr(self, "_should_reconnect", True),
             )
             await self.nova_client.start_session()
@@ -361,11 +425,39 @@ class InterviewConnectionManager:
             # Replay recent conversation history (trimmed to fit context limit)
             history = await self._load_history_from_db()
             if history:
-                await self._replay_history(history)
+                trimmed = history[-10:]  # Last 10 messages
+                await self._replay_history(trimmed)
+
+            # Inject greeting trigger (interactive=True) so AI resumes speaking
+            # Without this, the AI sits silent waiting for user input after reconnect.
+            kick_name = str(uuid.uuid4())
+            await self.nova_client.send_event(json.dumps({
+                "event": {"contentStart": {
+                    "promptName": self.nova_client.prompt_name,
+                    "contentName": kick_name,
+                    "type": "TEXT",
+                    "interactive": True,
+                    "role": "USER",
+                    "textInputConfiguration": {"mediaType": "text/plain"},
+                }}
+            }))
+            await self.nova_client.send_event(json.dumps({
+                "event": {"textInput": {
+                    "promptName": self.nova_client.prompt_name,
+                    "contentName": kick_name,
+                    "content": GREETING_TRIGGER_MARKER,
+                }}
+            }))
+            await self.nova_client.send_event(json.dumps({
+                "event": {"contentEnd": {
+                    "promptName": self.nova_client.prompt_name,
+                    "contentName": kick_name,
+                }}
+            }))
 
             # Re-open the persistent audio stream
             await self.nova_client.open_audio_stream()
-            logger.info("Auto-reconnect complete — conversation history replayed, audio stream open")
+            logger.info("Auto-reconnect complete — history replayed, greeting sent, audio stream open")
 
             # Notify frontend reconnect succeeded
             if self.active_connection:
@@ -389,6 +481,126 @@ class InterviewConnectionManager:
         """Return True if the AI's accumulated response contains a wrap-up phrase."""
         text_lower = text.lower()
         return any(phrase in text_lower for phrase in _INTERVIEW_COMPLETE_PHRASES)
+
+    async def _switch_panelist(self):
+        """Switch to the next panelist in a panel interview.
+        Closes the current Nova Sonic stream, creates a new one with the next
+        panelist's persona and voice, replays conversation history, and notifies
+        the frontend.
+        """
+        self._switching_panelist = True
+        next_index = self._panel_index + 1
+        next_panelist = self._panel_rotation[next_index]
+        logger.info(f"Panel switch: {self._panel_rotation[self._panel_index]['name']} → {next_panelist['name']}")
+
+        # Save any pending assistant message before switching
+        if self.current_assistant_message.strip():
+            await self.save_message("ASSISTANT", self.current_assistant_message.strip())
+            self.add_history("ASSISTANT", self.current_assistant_message.strip())
+            self.current_assistant_message = ""
+
+        # Notify frontend of the upcoming switch
+        if self.active_connection:
+            try:
+                await self.active_connection.send_text(json.dumps({
+                    "event": {"panelistSwitching": {
+                        "from": self._panel_rotation[self._panel_index]["name"],
+                        "to": next_panelist["name"],
+                        "role": next_panelist.get("role", "Interviewer"),
+                    }}
+                }))
+            except Exception:
+                pass
+
+        # Properly shut down the old Nova Sonic session.
+        # end_session() sets is_active=False and closes the stream, which stops
+        # _process_responses from trying to read events from the dead stream.
+        old_client = self.nova_client
+        if old_client:
+            await old_client.end_session()
+            # Cancel the response processing task to prevent ValidationException
+            if hasattr(old_client, 'response') and old_client.response and not old_client.response.done():
+                old_client.response.cancel()
+                try:
+                    await old_client.response
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        # Advance the rotation
+        self._panel_index = next_index
+        self._panel_user_responses = 0
+        self._persona = next_panelist
+        self._active_panelist = next_panelist["name"]
+        self.interviewer_name = next_panelist["name"]
+
+        # Create a new Nova Sonic client with the next panelist's persona + voice
+        self.nova_client = InterviewNovaSonic(
+            resume_text=self._resume_text,
+            job_description=self._job_description,
+            company_name=self._company_name,
+            role_title=self._role_title,
+            persona=next_panelist,
+            interview_type="panel",
+            panelist_index=self._panel_index,
+            panel_total=len(self._panel_rotation),
+            on_timeout=lambda: setattr(self, "_should_reconnect", True),
+        )
+        await self.nova_client.start_session()
+        logger.info(f"New Nova Sonic session started for {next_panelist['name']} (voice: {next_panelist.get('voice', 'default')})")
+
+        # Replay conversation history using the proper per-message pattern
+        # (resume-conversation reference: individual contentStart/textInput/contentEnd per msg)
+        history = await self._load_history_from_db()
+        if history:
+            trimmed = history[-10:]  # Last 10 messages — enough context without overwhelming
+            await self._replay_history(trimmed)
+
+        # Inject greeting trigger (interactive=True) so the new panelist starts speaking.
+        # Per the speaks-first reference pattern, interactive=True makes Nova Sonic
+        # treat this as real user input and generate a response.
+        kick_content = str(uuid.uuid4())
+        await self.nova_client.send_event(json.dumps({
+            "event": {"contentStart": {
+                "promptName": self.nova_client.prompt_name,
+                "contentName": kick_content,
+                "type": "TEXT",
+                "interactive": True,
+                "role": "USER",
+                "textInputConfiguration": {"mediaType": "text/plain"},
+            }}
+        }))
+        await self.nova_client.send_event(json.dumps({
+            "event": {"textInput": {
+                "promptName": self.nova_client.prompt_name,
+                "contentName": kick_content,
+                "content": GREETING_TRIGGER_MARKER,
+            }}
+        }))
+        await self.nova_client.send_event(json.dumps({
+            "event": {"contentEnd": {
+                "promptName": self.nova_client.prompt_name,
+                "contentName": kick_content,
+            }}
+        }))
+
+        # Re-open the audio stream
+        await self.nova_client.open_audio_stream()
+        logger.info(f"Panel switch complete — {next_panelist['name']} is now active")
+
+        # Notify frontend the switch is done
+        if self.active_connection:
+            try:
+                await self.active_connection.send_text(json.dumps({
+                    "event": {"panelistSwitched": {
+                        "panelist": next_panelist["name"],
+                        "role": next_panelist.get("role", "Interviewer"),
+                        "index": self._panel_index,
+                    }}
+                }))
+            except Exception:
+                pass
+
+        self._switching_panelist = False
 
     async def process_audio_responses(self):
         """Drain audio queue and send binary chunks to frontend. Restarts after reconnect."""
@@ -482,6 +694,17 @@ class InterviewConnectionManager:
                                         await self.save_message("USER", self.current_user_message.strip())
                                         self.add_history("USER", self.current_user_message.strip())
                                         self.current_user_message = ""
+
+                                        # Panel mode: count user responses and trigger panelist switch
+                                        if (self._interview_type == "panel"
+                                                and not self._switching_panelist
+                                                and self._panel_rotation):
+                                            self._panel_user_responses += 1
+                                            if (self._panel_user_responses >= self._questions_per_panelist
+                                                    and self._panel_index < len(self._panel_rotation) - 1):
+                                                await self._switch_panelist()
+                                                continue
+
                                     elif self.last_message_role == "ASSISTANT" and self.current_assistant_message.strip():
                                         await self.save_message("ASSISTANT", self.current_assistant_message.strip())
                                         self.add_history("ASSISTANT", self.current_assistant_message.strip())
@@ -493,6 +716,12 @@ class InterviewConnectionManager:
                                         self.current_user_message += text_content
                                 else:  # ASSISTANT
                                     self.current_assistant_message += text_content
+
+                                    # Panel mode: tag every assistant event with the active panelist
+                                    if self._interview_type == "panel" and self._active_panelist:
+                                        event_data["event"]["textOutput"]["panelist"] = self._active_panelist
+                                        event_json = json.dumps(event_data)
+
                                     # Detect interview completion phrases in AI responses
                                     if self._check_interview_complete(self.current_assistant_message):
                                         complete_event = json.dumps({
@@ -648,13 +877,20 @@ async def interview_websocket(websocket: WebSocket, session_id: str, token: str 
     await manager.connect(websocket, resume_text, job_description, company_name, role_title)
 
     # Send init event
+    init_payload = {
+        "sessionId": session_id,
+        "status": "connected",
+        "interviewerName": manager.interviewer_name,
+        "interviewType": manager._interview_type,
+    }
+    if manager._interview_type == "panel":
+        init_payload["panelists"] = [
+            {"name": p["name"], "role": p["role"], "style": p["style"]}
+            for p in PANEL_PERSONAS
+        ]
     await websocket.send_text(json.dumps({
         "event": {
-            "init": {
-                "sessionId": session_id,
-                "status": "connected",
-                "interviewerName": manager.interviewer_name,
-            }
+            "init": init_payload
         }
     }))
 

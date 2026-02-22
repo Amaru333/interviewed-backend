@@ -43,6 +43,7 @@ class Session(Base):
     role_title: Mapped[str] = mapped_column(String, default="")
     interviewer_name: Mapped[Optional[str]] = mapped_column(String, default="", nullable=True)
     interviewer_voice: Mapped[Optional[str]] = mapped_column(String, default="", nullable=True)
+    interview_type: Mapped[str] = mapped_column(String, default="solo")  # "solo" or "panel"
     status: Mapped[str] = mapped_column(String, default="pending")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime, nullable=True)

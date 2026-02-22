@@ -38,6 +38,7 @@ class SessionCreate(BaseModel):
     job_description: str
     company_name: Optional[str] = ""
     role_title: Optional[str] = ""
+    interview_type: Optional[str] = "solo"  # "solo" or "panel"
 
 
 class SessionResponse(BaseModel):
@@ -49,6 +50,7 @@ class SessionResponse(BaseModel):
     role_title: str
     interviewer_name: Optional[str] = ""
     interviewer_voice: Optional[str] = ""
+    interview_type: Optional[str] = "solo"
     status: str
     created_at: str
     completed_at: Optional[str] = None
