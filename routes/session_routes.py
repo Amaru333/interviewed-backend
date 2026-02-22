@@ -341,11 +341,11 @@ async def get_session_analytics(
             problem_solving_score=score_row.problem_solving_score,
             confidence_score=score_row.confidence_score,
             relevance_score=score_row.relevance_score,
-            strengths=json.loads(score_row.strengths or "[]"),
-            improvements=json.loads(score_row.improvements or "[]"),
+            strengths=[s for s in json.loads(score_row.strengths or "[]") if s],
+            improvements=[i for i in json.loads(score_row.improvements or "[]") if i],
             detailed_feedback=score_row.detailed_feedback or "",
             question_scores=[
-                QuestionScore(**q) for q in json.loads(score_row.question_scores or "[]")
+                QuestionScore(**q) for q in json.loads(score_row.question_scores or "[]") if q
             ],
             created_at=str(score_row.created_at) if score_row.created_at else "",
         )
@@ -503,7 +503,7 @@ def _call_nova_lite(prompt: str) -> dict:
     client = boto3.client("bedrock-runtime", region_name=region)
 
     response = client.converse(
-        modelId="amazon.nova-lite-v1:0",
+        modelId="us.amazon.nova-2-lite-v1:0",
         system=[{"text": "You are an expert interview coach who provides detailed, constructive evaluations of practice interview performances."}],
         messages=[
             {
@@ -746,8 +746,8 @@ async def _generate_session_scores(db: AsyncSession, session_id: str):
         problem_solving_score=clamp(scores.get("problem_solving_score", 5)),
         confidence_score=clamp(scores.get("confidence_score", 5)),
         relevance_score=clamp(scores.get("relevance_score", 5)),
-        strengths=json.dumps(scores.get("strengths", [])),
-        improvements=json.dumps(scores.get("improvements", [])),
+        strengths=json.dumps([s for s in scores.get("strengths", []) if s]),
+        improvements=json.dumps([i for i in scores.get("improvements", []) if i]),
         detailed_feedback=scores.get("detailed_feedback", ""),
         question_scores=json.dumps(scores.get("question_scores", [])),
         created_at=now,

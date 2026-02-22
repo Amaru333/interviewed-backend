@@ -307,8 +307,12 @@ class InterviewConnectionManager:
 
         if self.nova_client:
             logger.info("Stopping interview session")
-            self.nova_client.is_active = False
+            # end_session() MUST be called before is_active=False.
+            # end_session() has a `if not self.is_active: return` guard, so
+            # calling it after would be a no-op and leave the AWS stream open
+            # for ~55 s until Nova Sonic times it out from its side.
             await self.nova_client.end_session()
+            self.nova_client.is_active = False
             self.nova_client = None
         self.active_connection = None
 

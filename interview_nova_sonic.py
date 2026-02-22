@@ -320,40 +320,15 @@ RULES:
         await self.send_event(audio_event)
 
     async def end_session(self):
-        """Properly close audio stream → prompt → session in the correct order."""
+        """Properly close the AWS Bedrock bidirectional stream."""
         if not self.is_active:
             return
+        self.is_active = False
         try:
-            # 1. Close the audio content container
-            audio_content_end = json.dumps({
-                "event": {
-                    "contentEnd": {
-                        "promptName": self.prompt_name,
-                        "contentName": self.audio_content_name,
-                    }
-                }
-            })
-            await self.send_event(audio_content_end)
-        except Exception:
-            pass
-        try:
-            # 2. End the prompt
-            prompt_end = json.dumps({
-                "event": {"promptEnd": {"promptName": self.prompt_name}}
-            })
-            await self.send_event(prompt_end)
-        except Exception:
-            pass
-        try:
-            # 3. End the session
-            session_end = json.dumps({"event": {"sessionEnd": {}}})
-            await self.send_event(session_end)
-        except Exception:
-            pass
-        try:
-            await self.stream.input_stream.close()
-        except Exception:
-            pass
+            if getattr(self, 'stream', None) and getattr(self.stream, 'input_stream', None):
+                await self.stream.input_stream.close()
+        except Exception as e:
+            print(f"Error closing input stream: {e}")
 
     async def _process_responses(self):
         """Process responses from Nova Sonic."""
