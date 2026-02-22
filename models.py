@@ -83,6 +83,12 @@ class QuestionScore(BaseModel):
     feedback: str
 
 
+class CompleteSessionRequest(BaseModel):
+    wpm: Optional[float] = 0.0
+    filler_count: Optional[int] = 0
+    confidence_score: Optional[float] = 0.0
+
+
 class SessionScoreResponse(BaseModel):
     id: str
     session_id: str
@@ -92,6 +98,8 @@ class SessionScoreResponse(BaseModel):
     problem_solving_score: float
     confidence_score: float
     relevance_score: float
+    wpm: float
+    filler_count: int
     strengths: List[str]
     improvements: List[str]
     detailed_feedback: str

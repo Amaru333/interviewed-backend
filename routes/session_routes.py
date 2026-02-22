@@ -19,6 +19,7 @@ from models import (
     SessionScoreResponse,
     QuestionScore,
     SessionAnalytics,
+    CompleteSessionRequest,
 )
 from auth import get_current_user_id
 
@@ -108,6 +109,8 @@ async def get_progress(
             "problem_solving": round(sc.problem_solving_score, 1),
             "confidence": round(sc.confidence_score, 1),
             "relevance": round(sc.relevance_score, 1),
+            "wpm": round(sc.wpm, 0) if hasattr(sc, "wpm") else 0,
+            "filler_count": sc.filler_count if hasattr(sc, "filler_count") else 0,
         })
 
     # Skill averages
@@ -122,6 +125,8 @@ async def get_progress(
         }
         average_score = round(sum(sc.overall_score for _, sc in scored_rows) / n, 1)
         best_score = round(max(sc.overall_score for _, sc in scored_rows), 1)
+        average_wpm = round(sum(getattr(sc, "wpm", 0) for _, sc in scored_rows) / n, 0)
+        total_fillers = sum(getattr(sc, "filler_count", 0) for _, sc in scored_rows)
 
         # Top / weakest
         top_strength = max(skill_averages, key=skill_averages.get)
@@ -130,6 +135,8 @@ async def get_progress(
         skill_averages = {"communication": 0, "technical": 0, "problem_solving": 0, "confidence": 0, "relevance": 0}
         average_score = 0
         best_score = 0
+        average_wpm = 0
+        total_fillers = 0
         top_strength = None
         weakest_skill = None
 
@@ -174,6 +181,8 @@ async def get_progress(
         "completed_sessions": completed_sessions,
         "average_score": average_score,
         "best_score": best_score,
+        "average_wpm": average_wpm,
+        "total_fillers": total_fillers,
         "total_practice_minutes": total_practice_minutes,
         "current_streak": current_streak,
         "score_trend": score_trend,
@@ -265,6 +274,7 @@ async def get_session(
 @router.post("/{session_id}/complete")
 async def complete_session(
     session_id: str,
+    metrics: CompleteSessionRequest = None,
     user_id: str = Depends(get_current_user_id),
     db: AsyncSession = Depends(get_db),
 ):
@@ -281,10 +291,14 @@ async def complete_session(
     now = datetime.utcnow()
     session.status = "completed"
     session.completed_at = now
-    await db.commit()
+    try:
+        await db.commit()
+    except Exception as e:
+        logger.error(f"Error marking session {session_id} as completed: {e}")
+        raise HTTPException(status_code=500, detail="Failed to complete session")
 
     # Generate scores from messages
-    await _generate_session_scores(db, session_id)
+    await _generate_session_scores(db, session_id, metrics)
 
     return {"message": "Session completed", "completed_at": now.isoformat()}
 
@@ -388,6 +402,8 @@ async def get_session_analytics(
             problem_solving_score=score_row.problem_solving_score,
             confidence_score=score_row.confidence_score,
             relevance_score=score_row.relevance_score,
+            wpm=score_row.wpm,
+            filler_count=score_row.filler_count,
             strengths=[s for s in json.loads(score_row.strengths or "[]") if s],
             improvements=[i for i in json.loads(score_row.improvements or "[]") if i],
             detailed_feedback=score_row.detailed_feedback or "",
@@ -646,7 +662,7 @@ def _heuristic_fallback(messages_data: list) -> dict:
     elif avg_response_length >= 15:
         improvements.append("Try to elaborate more — aim for at least 40–80 words per answer with specific examples")
     else:
-        improvements.append("Answers are very brief; use the STAR method (Situation, Task, Action, Result) to structure fuller responses")
+        improvements.append("Answers are very brief — use the STAR method (Situation, Task, Action, Result) to structure fuller responses")
 
     if tech_count >= 4:
         strengths.append("Demonstrates strong technical vocabulary")
@@ -725,7 +741,7 @@ def _heuristic_fallback(messages_data: list) -> dict:
     }
 
 
-async def _generate_session_scores(db: AsyncSession, session_id: str):
+async def _generate_session_scores(db: AsyncSession, session_id: str, metrics: CompleteSessionRequest = None):
     """Generate scores from interview messages using Amazon Nova Lite AI analysis.
     Falls back to heuristic scoring if the AI call fails."""
     result = await db.execute(
@@ -773,31 +789,56 @@ async def _generate_session_scores(db: AsyncSession, session_id: str):
         except (TypeError, ValueError):
             return 5.0
 
+    # Merge in frontend live metrics if provided
+    frontend_confidence = metrics.confidence_score if metrics and metrics.confidence_score else 0.0
+    wpm_val = metrics.wpm if metrics and metrics.wpm else 0.0
+    filler_val = metrics.filler_count if metrics and metrics.filler_count else 0
+
     # Upsert: delete existing score if any, then insert new one
     existing = await db.execute(
         select(SessionScore).where(SessionScore.session_id == session_id)
     )
     old_score = existing.scalar_one_or_none()
     if old_score:
-        await db.delete(old_score)
+        old_score.overall_score = clamp(scores.get("overall_score", 5))
+        old_score.communication_score = clamp(scores.get("communication_score", 5))
+        old_score.technical_score = clamp(scores.get("technical_score", 5))
+        old_score.problem_solving_score = clamp(scores.get("problem_solving_score", 5))
+        # Override AI confidence with frontend live confidence if available, else use AI's evaluation.
+        # Frontend returns 0-100 scale, database stores 0-10 scale
+        scaled_frontend_confidence = (frontend_confidence / 10.0) if frontend_confidence else None
+        old_score.confidence_score = clamp(scaled_frontend_confidence or scores.get("confidence_score", 5))
+        old_score.relevance_score = clamp(scores.get("relevance_score", 5))
+        old_score.wpm = wpm_val
+        old_score.filler_count = filler_val
+        old_score.strengths = json.dumps([s for s in scores.get("strengths", []) if s])
+        old_score.improvements = json.dumps([i for i in scores.get("improvements", []) if i])
+        old_score.detailed_feedback = scores.get("detailed_feedback", "")
+        old_score.question_scores = json.dumps(scores.get("question_scores", []))
+    else:
+        # Frontend returns 0-100 scale, database stores 0-10 scale
+        scaled_frontend_confidence = (frontend_confidence / 10.0) if frontend_confidence else None
+        new_score = SessionScore(
+            id=str(uuid.uuid4()),
+            session_id=session_id,
+            overall_score=clamp(scores.get("overall_score", 5)),
+            communication_score=clamp(scores.get("communication_score", 5)),
+            technical_score=clamp(scores.get("technical_score", 5)),
+            problem_solving_score=clamp(scores.get("problem_solving_score", 5)),
+            confidence_score=clamp(scaled_frontend_confidence or scores.get("confidence_score", 5)),
+            relevance_score=clamp(scores.get("relevance_score", 5)),
+            wpm=wpm_val,
+            filler_count=filler_val,
+            strengths=json.dumps([s for s in scores.get("strengths", []) if s]),
+            improvements=json.dumps([i for i in scores.get("improvements", []) if i]),
+            detailed_feedback=scores.get("detailed_feedback", ""),
+            question_scores=json.dumps(scores.get("question_scores", [])),
+        )
+        db.add(new_score)
 
-    score_id = str(uuid.uuid4())
-    now = datetime.utcnow()
-
-    new_score = SessionScore(
-        id=score_id,
-        session_id=session_id,
-        overall_score=clamp(scores.get("overall_score", 5)),
-        communication_score=clamp(scores.get("communication_score", 5)),
-        technical_score=clamp(scores.get("technical_score", 5)),
-        problem_solving_score=clamp(scores.get("problem_solving_score", 5)),
-        confidence_score=clamp(scores.get("confidence_score", 5)),
-        relevance_score=clamp(scores.get("relevance_score", 5)),
-        strengths=json.dumps([s for s in scores.get("strengths", []) if s]),
-        improvements=json.dumps([i for i in scores.get("improvements", []) if i]),
-        detailed_feedback=scores.get("detailed_feedback", ""),
-        question_scores=json.dumps(scores.get("question_scores", [])),
-        created_at=now,
-    )
-    db.add(new_score)
-    await db.commit()
+    try:
+        await db.commit()
+        logger.info(f"Successfully saved scores for session {session_id}")
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Failed to save scores for session {session_id}: {e}")

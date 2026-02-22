@@ -1,7 +1,7 @@
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, Float, DateTime, ForeignKey, func
+from sqlalchemy import String, Text, Float, Integer, DateTime, ForeignKey, func
 from datetime import datetime
 from typing import Optional
 
@@ -75,6 +75,8 @@ class SessionScore(Base):
     problem_solving_score: Mapped[float] = mapped_column(Float, default=0)
     confidence_score: Mapped[float] = mapped_column(Float, default=0)
     relevance_score: Mapped[float] = mapped_column(Float, default=0)
+    wpm: Mapped[float] = mapped_column(Float, default=0)
+    filler_count: Mapped[int] = mapped_column(Integer, default=0)
     strengths: Mapped[str] = mapped_column(Text, default="[]")
     improvements: Mapped[str] = mapped_column(Text, default="[]")
     detailed_feedback: Mapped[str] = mapped_column(Text, default="")
