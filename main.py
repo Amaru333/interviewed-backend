@@ -29,6 +29,10 @@ logger = logging.getLogger(__name__)
 # the saved transcript if Nova Sonic ever echoes the text input back as a textOutput.
 GREETING_TRIGGER_MARKER = "Please introduce yourself and begin the interview."
 
+# Separate trigger for auto-reconnect — instructs the AI to continue seamlessly
+# without re-introducing itself so the user doesn't notice the reconnection.
+RECONNECT_TRIGGER_MARKER = "Continue the interview from where we left off. Do NOT re-introduce yourself or greet the candidate again — just pick up naturally with your next question."
+
 # Phrases that indicate the AI has wrapped up the interview
 _INTERVIEW_COMPLETE_PHRASES = [
     "interview is complete",
@@ -445,7 +449,7 @@ class InterviewConnectionManager:
                 "event": {"textInput": {
                     "promptName": self.nova_client.prompt_name,
                     "contentName": kick_name,
-                    "content": GREETING_TRIGGER_MARKER,
+                    "content": RECONNECT_TRIGGER_MARKER,
                 }}
             }))
             await self.nova_client.send_event(json.dumps({
@@ -457,7 +461,13 @@ class InterviewConnectionManager:
 
             # Re-open the persistent audio stream
             await self.nova_client.open_audio_stream()
-            logger.info("Auto-reconnect complete — history replayed, greeting sent, audio stream open")
+            logger.info("Auto-reconnect complete — history replayed, resume trigger sent, audio stream open")
+
+            # Clear accumulation buffers so old text from before the timeout
+            # doesn't merge with the new agent's responses (prevents duplicate content)
+            self.current_assistant_message = ""
+            self.current_user_message = ""
+            self.last_message_role = None
 
             # Notify frontend reconnect succeeded
             if self.active_connection:
@@ -712,7 +722,7 @@ class InterviewConnectionManager:
 
                                 # Accumulate current chunk — skip the greeting trigger sentinel
                                 if role == "USER":
-                                    if GREETING_TRIGGER_MARKER not in text_content:
+                                    if GREETING_TRIGGER_MARKER not in text_content and RECONNECT_TRIGGER_MARKER not in text_content:
                                         self.current_user_message += text_content
                                 else:  # ASSISTANT
                                     self.current_assistant_message += text_content
@@ -905,7 +915,63 @@ async def interview_websocket(websocket: WebSocket, session_id: str, token: str 
             elif "text" in message:
                 try:
                     data = json.loads(message["text"])
-                    if "event" in data:
+                    if data.get("type") == "code_submission":
+                        # ── Handle code shared from the coding editor ──
+                        code = data.get("code", "")
+                        lang = data.get("language", "python")
+                        if code.strip() and manager.nova_client and manager.nova_client.is_active:
+                            # Save any pending assistant message first
+                            if manager.current_assistant_message.strip():
+                                await manager.save_message("ASSISTANT", manager.current_assistant_message.strip())
+                                manager.add_history("ASSISTANT", manager.current_assistant_message.strip())
+                                manager.current_assistant_message = ""
+
+                            # Save code as a CODE message in the transcript
+                            code_text = f"```{lang}\n{code}\n```"
+                            await manager.save_message("CODE", code_text)
+                            manager.add_history("USER", f"[Code submission in {lang}]:\n{code_text}")
+
+                            # Truncate very large submissions to avoid overwhelming Nova Sonic
+                            truncated_code = code[:2000] + ("\n# ... (truncated)" if len(code) > 2000 else "")
+
+                            # Close the audio stream first — Nova Sonic can't have two
+                            # interactive content blocks open simultaneously
+                            await manager.nova_client.close_audio_stream()
+                            await asyncio.sleep(0.05)  # Brief settle
+
+                            # Inject code into Nova Sonic as interactive text so the AI reviews it
+                            code_content_name = str(uuid.uuid4())
+                            code_prompt = f"The candidate has submitted the following {lang} code for your review:\n```{lang}\n{truncated_code}\n```\nPlease review it and provide feedback."
+                            await manager.nova_client.send_event(json.dumps({
+                                "event": {"contentStart": {
+                                    "promptName": manager.nova_client.prompt_name,
+                                    "contentName": code_content_name,
+                                    "type": "TEXT",
+                                    "interactive": True,
+                                    "role": "USER",
+                                    "textInputConfiguration": {"mediaType": "text/plain"},
+                                }}
+                            }))
+                            await manager.nova_client.send_event(json.dumps({
+                                "event": {"textInput": {
+                                    "promptName": manager.nova_client.prompt_name,
+                                    "contentName": code_content_name,
+                                    "content": code_prompt,
+                                }}
+                            }))
+                            await manager.nova_client.send_event(json.dumps({
+                                "event": {"contentEnd": {
+                                    "promptName": manager.nova_client.prompt_name,
+                                    "contentName": code_content_name,
+                                }}
+                            }))
+
+                            # Reopen the audio stream so mic input resumes
+                            await manager.nova_client.open_audio_stream()
+
+                            manager.last_message_role = "USER"
+                            logger.info(f"Code submission injected into Nova Sonic ({lang}, {len(code)} chars)")
+                    elif "event" in data:
                         event = data["event"]
                         if "textInput" in event:
                             user_text = event["textInput"].get("content", "")

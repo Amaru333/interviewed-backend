@@ -537,8 +537,11 @@ def _build_scoring_prompt(messages_data: list, job_description: str, role_title:
     """Build the user prompt for interview evaluation."""
     transcript_lines = []
     for role, content in messages_data:
-        speaker = "Interviewer" if role == "ASSISTANT" else "Candidate"
-        transcript_lines.append(f"{speaker}: {content}")
+        if role == "CODE":
+            transcript_lines.append(f"Candidate [Code Submission]:\n{content}")
+        else:
+            speaker = "Interviewer" if role == "ASSISTANT" else "Candidate"
+            transcript_lines.append(f"{speaker}: {content}")
     transcript = "\n".join(transcript_lines)
 
     resume_section = (

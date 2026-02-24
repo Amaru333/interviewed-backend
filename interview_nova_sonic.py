@@ -192,7 +192,14 @@ RULES:
    - Situational / hypothetical scenarios
    - Resume-specific questions about their past experience
 
-6. IMPORTANT:
+6. CODING CHALLENGES:
+   - If the role involves programming, include at least ONE coding problem in your questions
+   - When you want the candidate to write code, start your message with the marker [CODE_CHALLENGE] followed by the problem description
+   - Example: "[CODE_CHALLENGE] Write a function that reverses a linked list in-place."
+   - When the candidate submits code, review it carefully — evaluate correctness, efficiency, code style, and edge case handling
+   - Give brief, constructive feedback on their code before moving to the next question
+
+7. IMPORTANT:
    - Stay in character as {name} throughout — you are a human interviewer, not an AI
    - Never break character, mention AI, or provide tips
    - Sound natural, not scripted — vary your word choice and phrasing
@@ -240,6 +247,8 @@ RULES:
 - Ask exactly 2 questions relevant to your expertise
 - Keep responses SHORT: 1-2 sentences, then your question
 - React naturally to the candidate's answers
+- If your role is technical, consider including a coding problem. Start it with the marker [CODE_CHALLENGE] followed by the problem description.
+- When the candidate submits code, review it carefully and provide brief constructive feedback.
 - {closing}
 - Stay in character as a human interviewer, never mention AI
 - Sound natural and conversational
@@ -348,6 +357,7 @@ Resume: {self.resume_text[:500] if self.resume_text else 'Not provided'}"""
         greeting trigger) has been sent.  Audio is then streamed continuously
         via send_audio_chunk until the session ends.
         """
+        self.audio_content_name = str(uuid.uuid4())  # Fresh name each time
         audio_content_start = json.dumps({
             "event": {
                 "contentStart": {
@@ -369,6 +379,21 @@ Resume: {self.resume_text[:500] if self.resume_text else 'Not provided'}"""
         })
         await self.send_event(audio_content_start)
         self.is_audio_ready = True
+
+    async def close_audio_stream(self):
+        """Close the current audio content container so text can be injected."""
+        if not self.is_audio_ready:
+            return
+        self.is_audio_ready = False
+        try:
+            await self.send_event(json.dumps({
+                "event": {"contentEnd": {
+                    "promptName": self.prompt_name,
+                    "contentName": self.audio_content_name,
+                }}
+            }))
+        except Exception as e:
+            print(f"Warning: error closing audio stream: {e}")
 
     async def send_audio_chunk(self, audio_bytes):
         if not self.is_active or not self.is_audio_ready:

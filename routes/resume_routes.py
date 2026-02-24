@@ -27,11 +27,11 @@ async def upload_resume(
             reader = PdfReader(io.BytesIO(content))
             pages = [page.extract_text() or "" for page in reader.pages]
             text_content = "\n".join(pages).strip()
-        except ImportError:
-            # PyPDF2 not installed — store placeholder
-            text_content = f"[PDF file uploaded: {filename}. Install PyPDF2 for text extraction.]"
-        except Exception:
-            text_content = f"[PDF file uploaded: {filename}. Could not extract text.]"
+        except ImportError as e:
+            # PyPDF2 not installed — fail loudly
+            raise HTTPException(status_code=500, detail=f"PDF parsing library missing. Install PyPDF2 to extract text from {filename}.") from e
+        except Exception as e:
+            raise HTTPException(status_code=400, detail=f"Could not extract text from PDF: {filename}. Please provide a valid text-based PDF or use the text upload option.") from e
     else:
         text_content = content.decode("utf-8", errors="ignore")
 
