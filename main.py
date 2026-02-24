@@ -234,22 +234,6 @@ class InterviewConnectionManager:
         self.active_connection = websocket
         logger.info(f"WebSocket accepted for session {self.session_id}")
 
-        # Update session status to active
-        async with async_session() as db:
-            from sqlalchemy import select
-            result = await db.execute(
-                select(SessionModel).where(SessionModel.id == self.session_id)
-            )
-            session = result.scalar_one_or_none()
-            if session:
-                session.status = "active"
-                await db.commit()
-
-        # Pick a random interviewer persona for this session
-        persona = pick_random_persona()
-        self._persona = persona
-
-        # Determine interview type
         interview_type = "solo"
         async with async_session() as db:
             from sqlalchemy import select
@@ -258,8 +242,14 @@ class InterviewConnectionManager:
             )
             sess = result.scalar_one_or_none()
             if sess:
+                sess.status = "active"
+                await db.commit()
                 interview_type = getattr(sess, "interview_type", "solo") or "solo"
         self._interview_type = interview_type
+
+        # Pick a random interviewer persona for this session
+        persona = pick_random_persona()
+        self._persona = persona
 
         # For panel mode, set up multi-agent rotation
         if self._interview_type == "panel":
