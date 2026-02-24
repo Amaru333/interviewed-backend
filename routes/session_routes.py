@@ -429,6 +429,89 @@ async def get_session_analytics(
     )
 
 
+@router.get("/public/{session_id}", response_model=SessionAnalytics)
+async def get_public_session_analytics(
+    session_id: str,
+    db: AsyncSession = Depends(get_db),
+):
+    # Get session without user_id check for public viewing
+    result = await db.execute(
+        select(SessionModel).where(SessionModel.id == session_id)
+    )
+    s = result.scalar_one_or_none()
+    if not s:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    session = _session_to_response(s)
+
+    # Get messages
+    result = await db.execute(
+        select(Message)
+        .where(Message.session_id == session_id)
+        .order_by(Message.timestamp.asc())
+    )
+    msg_rows = result.scalars().all()
+    messages = [
+        MessageResponse(
+            id=m.id,
+            session_id=m.session_id,
+            role=m.role,
+            content=m.content,
+            timestamp=str(m.timestamp) if m.timestamp else "",
+        )
+        for m in msg_rows
+    ]
+
+    total_questions = sum(
+        1 for m in messages if m.role == "ASSISTANT" and "?" in m.content
+    )
+
+    duration = None
+    if s.completed_at and s.created_at:
+        try:
+            duration = (s.completed_at - s.created_at).total_seconds()
+        except Exception:
+            pass
+
+    score = None
+    result = await db.execute(
+        select(SessionScore).where(SessionScore.session_id == session_id)
+    )
+    score_row = result.scalar_one_or_none()
+    if score_row:
+        score = SessionScoreResponse(
+            id=score_row.id,
+            session_id=score_row.session_id,
+            overall_score=score_row.overall_score,
+            communication_score=score_row.communication_score,
+            technical_score=score_row.technical_score,
+            problem_solving_score=score_row.problem_solving_score,
+            confidence_score=score_row.confidence_score,
+            relevance_score=score_row.relevance_score,
+            wpm=score_row.wpm,
+            filler_count=score_row.filler_count,
+            strengths=[s for s in json.loads(score_row.strengths or "[]") if s],
+            improvements=[i for i in json.loads(score_row.improvements or "[]") if i],
+            detailed_feedback=score_row.detailed_feedback or "",
+            question_scores=[
+                QuestionScore(**q) for q in json.loads(score_row.question_scores or "[]") if q
+            ],
+            created_at=str(score_row.created_at) if score_row.created_at else "",
+        )
+        ai_question_count = len(json.loads(score_row.question_scores or "[]"))
+        if ai_question_count > 0:
+            total_questions = ai_question_count
+
+    return SessionAnalytics(
+        session=session,
+        score=score,
+        messages=messages,
+        total_questions=total_questions,
+        total_duration_seconds=duration,
+    )
+
+
+
 # ─── Tool config for structured output via constrained decoding ──────
 
 SCORING_TOOL_CONFIG = {
@@ -506,8 +589,12 @@ SCORING_TOOL_CONFIG = {
                                             "type": "string",
                                             "description": "1-2 sentence specific feedback for this answer",
                                         },
+                                        "ideal_answer": {
+                                            "type": "string",
+                                            "description": "A high-quality, comprehensive ideal answer to the question",
+                                        },
                                     },
-                                    "required": ["question", "answer_summary", "score", "feedback"],
+                                    "required": ["question", "answer_summary", "score", "feedback", "ideal_answer"],
                                 },
                                 "description": "Per-question evaluation, one entry per interviewer question",
                             },
@@ -726,6 +813,7 @@ def _heuristic_fallback(messages_data: list) -> dict:
                         else "Decent answer but could benefit from more depth and examples." if q_score >= 4
                         else "Answer was too brief — expand with specific examples and context."
                     ),
+                    "ideal_answer": "AI scoring unavailable, so an ideal answer cannot be provided here.",
                 })
 
     return {

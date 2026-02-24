@@ -83,6 +83,7 @@ class QuestionScore(BaseModel):
     answer_summary: str
     score: float
     feedback: str
+    ideal_answer: Optional[str] = ""
 
 
 class CompleteSessionRequest(BaseModel):
