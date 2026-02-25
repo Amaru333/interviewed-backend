@@ -42,6 +42,7 @@ async def register(data: UserRegister, db: AsyncSession = Depends(get_db)):
             name=data.name,
             resume_text="",
             resume_filename="",
+            is_onboarded=False,
             created_at="",
         ),
     )
@@ -67,6 +68,7 @@ async def login(data: UserLogin, db: AsyncSession = Depends(get_db)):
             name=user.name,
             resume_text=user.resume_text or "",
             resume_filename=user.resume_filename or "",
+            is_onboarded=user.is_onboarded or False,
             created_at=str(user.created_at) if user.created_at else "",
         ),
     )
@@ -85,8 +87,21 @@ async def get_me(user_id: str = Depends(get_current_user_id), db: AsyncSession =
         name=user.name,
         resume_text=user.resume_text or "",
         resume_filename=user.resume_filename or "",
+        is_onboarded=user.is_onboarded or False,
         created_at=str(user.created_at) if user.created_at else "",
     )
+
+
+@router.post("/onboarded")
+async def mark_onboarded(user_id: str = Depends(get_current_user_id), db: AsyncSession = Depends(get_db)):
+    result = await db.execute(select(User).where(User.id == user_id))
+    user = result.scalar_one_or_none()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.is_onboarded = True
+    await db.commit()
+    return {"message": "Onboarding complete"}
 
 
 @router.post("/resume")

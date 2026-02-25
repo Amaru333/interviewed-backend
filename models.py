@@ -22,6 +22,7 @@ class UserResponse(BaseModel):
     name: str
     resume_text: str
     resume_filename: str
+    is_onboarded: bool = False
     created_at: str
 
 

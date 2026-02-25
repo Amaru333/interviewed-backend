@@ -1,7 +1,7 @@
 import os
 from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
-from sqlalchemy import String, Text, Float, Integer, DateTime, ForeignKey, func
+from sqlalchemy import String, Text, Float, Integer, DateTime, Boolean, ForeignKey, func
 from datetime import datetime
 from typing import Optional
 
@@ -27,6 +27,7 @@ class User(Base):
     password_hash: Mapped[str] = mapped_column(String, nullable=False)
     resume_text: Mapped[str] = mapped_column(Text, default="")
     resume_filename: Mapped[str] = mapped_column(String, default="")
+    is_onboarded: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
     created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
 
     sessions: Mapped[list["Session"]] = relationship(back_populates="user", cascade="all, delete-orphan")
