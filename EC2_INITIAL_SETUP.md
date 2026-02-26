@@ -1,4 +1,4 @@
-# 🚨 URGENT: EC2 Backend Not Set Up
+# URGENT: EC2 Backend Not Set Up
 
 ## The Problem
 
