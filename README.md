@@ -1,6 +1,38 @@
-# 🚀 Backend Deployment Setup
+# 🚀 Interviewed - Backend
 
-This backend is set up as a **separate repository** with its own GitHub Actions workflow.
+This is the backend service for **Interviewed**, an AI-powered interview platform utilizing real-time conversational AI, audio processing, and live code evaluation.
+
+It is built with **FastAPI**, **PostgreSQL** (via AsyncPG/SQLAlchemy), and integrates with **Amazon Nova (Bedrock)** for real-time AI capabilities.
+
+## 🌟 Features
+
+- **Real-Time Conversational AI**: WebSocket-based streaming audio processing via Amazon Nova Sonic.
+- **Session Management & Analytics**: Tracks interview metrics including confidence, typing speed (WPM), and filler word counts.
+- **Live Coding Evaluation**: Processes code challenge submissions in real-time.
+- **Resume Processing**: Parses uploaded PDFs to extract context for the AI interviewer.
+
+## 🛠️ Local Development
+
+1. Create a virtual environment:
+   ```bash
+   python3 -m venv venv
+   source venv/bin/activate
+   ```
+2. Install dependencies:
+   ```bash
+   pip install -r requirements.txt
+   ```
+3. Set up `.env` (copy from `.env.example` and fill in secrets).
+4. Run the server:
+   ```bash
+   python main.py
+   ```
+
+---
+
+## 🚀 Deployment Setup
+
+This backend is set up as a **separate repository** with its own GitHub Actions workflow for EC2 deployment.
 
 ## Quick Setup
 
