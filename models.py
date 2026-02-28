@@ -32,6 +32,78 @@ class TokenResponse(BaseModel):
     user: UserResponse
 
 
+# ─── Recruiter Auth Models ──────────────────────────────────
+
+class RecruiterRegister(BaseModel):
+    email: str
+    name: str
+    company_name: str
+    password: str
+
+
+class RecruiterLogin(BaseModel):
+    email: str
+    password: str
+
+
+class RecruiterResponse(BaseModel):
+    id: str
+    email: str
+    name: str
+    company_name: str
+    created_at: str
+
+
+class RecruiterTokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    recruiter: RecruiterResponse
+
+
+# ─── Job & Invite Models ────────────────────────────────────
+
+class JobCreate(BaseModel):
+    title: str
+    description: str
+
+
+class JobResponse(BaseModel):
+    id: str
+    recruiter_id: str
+    title: str
+    description: str
+    status: str
+    created_at: str
+
+
+class InviteCreate(BaseModel):
+    candidate_email: str
+    expires_in_days: int = 7
+
+
+class InviteResponse(BaseModel):
+    id: str
+    job_id: str
+    candidate_email: str
+    token: str
+    status: str
+    session_id: Optional[str] = None
+    expires_at: str
+    created_at: str
+
+
+class JobWithInvitesResponse(BaseModel):
+    job: JobResponse
+    invites: List[InviteResponse]
+    stats: dict
+
+
+class InviteDetailsResponse(BaseModel):
+    invite: InviteResponse
+    job: JobResponse
+
+
+
 # ─── Session Models ─────────────────────────────────────────
 
 class SessionCreate(BaseModel):

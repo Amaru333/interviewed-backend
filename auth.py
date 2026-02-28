@@ -33,9 +33,9 @@ def verify_password(plain_password: str, hashed_password: str) -> bool:
     return bcrypt.checkpw(plain_password.encode("utf-8"), hashed_password.encode("utf-8"))
 
 
-def create_access_token(user_id: str) -> str:
+def create_access_token(user_id: str, role: str = "candidate") -> str:
     expire = datetime.utcnow() + timedelta(hours=ACCESS_TOKEN_EXPIRE_HOURS)
-    to_encode = {"sub": user_id, "exp": expire}
+    to_encode = {"sub": user_id, "role": role, "exp": expire}
     return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
 
 
@@ -45,8 +45,23 @@ async def get_current_user_id(
     try:
         payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
         user_id: str = payload.get("sub")
-        if user_id is None:
-            raise HTTPException(status_code=401, detail="Invalid token")
+        role: str = payload.get("role", "candidate")
+        if user_id is None or role != "candidate":
+            raise HTTPException(status_code=401, detail="Invalid token or role")
+        return user_id
+    except JWTError:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+
+async def get_current_recruiter_id(
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> str:
+    try:
+        payload = jwt.decode(credentials.credentials, SECRET_KEY, algorithms=[ALGORITHM])
+        user_id: str = payload.get("sub")
+        role: str = payload.get("role", "candidate")
+        if user_id is None or role != "recruiter":
+            raise HTTPException(status_code=401, detail="Invalid token or role")
         return user_id
     except JWTError:
         raise HTTPException(status_code=401, detail="Invalid token")

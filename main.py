@@ -20,6 +20,7 @@ from auth import SECRET_KEY, ALGORITHM
 from routes.auth_routes import router as auth_router
 from routes.session_routes import router as session_router
 from routes.resume_routes import router as resume_router
+from routes.recruiter_routes import router as recruiter_router
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -65,8 +66,10 @@ app = FastAPI(title="Interviewed API", lifespan=lifespan)
 ALLOWED_ORIGINS = [
     "http://localhost:3000",       # Next.js Default
     "http://127.0.0.1:3000",
+    "http://hire.localhost:3000",  # Local Recruiter Subdomain
     "https://interviewed.space",    # Production Frontend (assumed)
     "https://www.interviewed.space",
+    "https://hire.interviewed.space", # Production Recruiter Subdomain
 ]
 
 app.add_middleware(
@@ -81,6 +84,7 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(session_router)
 app.include_router(resume_router)
+app.include_router(recruiter_router)
 
 
 class InterviewConnectionManager:

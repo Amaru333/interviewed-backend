@@ -66,6 +66,49 @@ class Message(Base):
     session: Mapped["Session"] = relationship(back_populates="messages")
 
 
+class Recruiter(Base):
+    __tablename__ = "recruiters"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    email: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    name: Mapped[str] = mapped_column(String, nullable=False)
+    company_name: Mapped[str] = mapped_column(String, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    jobs: Mapped[list["Job"]] = relationship(back_populates="recruiter", cascade="all, delete-orphan")
+
+
+class Job(Base):
+    __tablename__ = "jobs"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    recruiter_id: Mapped[str] = mapped_column(ForeignKey("recruiters.id"), nullable=False)
+    title: Mapped[str] = mapped_column(String, nullable=False)
+    description: Mapped[Text] = mapped_column(Text, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="active") # active, closed
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    recruiter: Mapped["Recruiter"] = relationship(back_populates="jobs")
+    invites: Mapped[list["InterviewInvite"]] = relationship(back_populates="job", cascade="all, delete-orphan")
+
+
+class InterviewInvite(Base):
+    __tablename__ = "interview_invites"
+
+    id: Mapped[str] = mapped_column(String, primary_key=True)
+    job_id: Mapped[str] = mapped_column(ForeignKey("jobs.id"), nullable=False)
+    candidate_email: Mapped[str] = mapped_column(String, nullable=False)
+    token: Mapped[str] = mapped_column(String, unique=True, nullable=False)
+    status: Mapped[str] = mapped_column(String, default="pending") # pending, completed
+    session_id: Mapped[Optional[str]] = mapped_column(ForeignKey("sessions.id"), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    job: Mapped["Job"] = relationship(back_populates="invites")
+    session: Mapped[Optional["Session"]] = relationship("Session", uselist=False)
+
+
 class SessionScore(Base):
     __tablename__ = "session_scores"
 

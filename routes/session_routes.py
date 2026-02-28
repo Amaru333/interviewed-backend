@@ -1,6 +1,7 @@
 from fastapi import APIRouter, HTTPException, Depends
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy import select
+from sqlalchemy.future import select
+from sqlalchemy.orm import joinedload
 import uuid
 import json
 import asyncio
@@ -10,7 +11,7 @@ from datetime import datetime
 
 import boto3
 
-from database import get_db, Session as SessionModel, Message, SessionScore, User
+from database import get_db, Session as SessionModel, Message, SessionScore, User, InterviewInvite, Job
 from models import (
     SessionCreate,
     SessionResponse,
@@ -79,6 +80,107 @@ async def create_session(
         status="pending",
         created_at=now.isoformat(),
     )
+
+
+@router.get("/invite/{token}")
+async def validate_invite_token(token: str, db: AsyncSession = Depends(get_db)):
+    """Validate an interview invite token and return basic job details."""
+    result = await db.execute(
+        select(InterviewInvite).where(InterviewInvite.token == token)
+    )
+    invite = result.scalars().first()
+    
+    if not invite:
+        raise HTTPException(status_code=404, detail="Invalid invite token")
+        
+    if invite.status == "completed":
+        raise HTTPException(status_code=400, detail="This invite has already been used")
+        
+    if invite.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="This invite has expired")
+        
+    job_result = await db.execute(
+        select(Job).options(joinedload(Job.recruiter)).where(Job.id == invite.job_id)
+    )
+    job = job_result.scalars().first()
+    
+    if not job:
+        raise HTTPException(status_code=404, detail="Associated job not found")
+        
+    return {
+        "valid": True,
+        "invite_id": invite.id,
+        "candidate_email": invite.candidate_email,
+        "job": {
+            "title": job.title,
+            "description": job.description,
+            "company_name": job.recruiter.company_name if hasattr(job, "recruiter") and job.recruiter else "Company"
+        }
+    }
+
+
+class SessionFromInviteRequest(SessionCreate):
+    token: str
+
+
+@router.post("/from-invite", response_model=SessionResponse)
+async def create_session_from_invite(
+    data: SessionFromInviteRequest,
+    user_id: str = Depends(get_current_user_id),
+    db: AsyncSession = Depends(get_db),
+):
+    """Create a new session consumed from an invite token."""
+    # 1. Validate the token
+    result = await db.execute(
+        select(InterviewInvite).where(InterviewInvite.token == data.token)
+    )
+    invite = result.scalars().first()
+    
+    if not invite or invite.status == "completed" or invite.expires_at < datetime.utcnow():
+        raise HTTPException(status_code=400, detail="Invalid, expired, or used invite token")
+
+    # 2. Verify user email matches the invite
+    user_result = await db.execute(select(User).where(User.id == user_id))
+    user = user_result.scalars().first()
+    
+    if not user or user.email.lower() != invite.candidate_email.lower():
+        raise HTTPException(status_code=403, detail="You must log in with the email address that received the invite")
+
+    # 3. Create Session as normal
+    session_id = str(uuid.uuid4())
+    now = datetime.utcnow()
+
+    session = SessionModel(
+        id=session_id,
+        user_id=user_id,
+        name=data.name,
+        job_description=data.job_description,
+        company_name=data.company_name or "",
+        role_title=data.role_title or "",
+        interview_type=data.interview_type or "solo",
+        status="pending",
+        created_at=now,
+    )
+    db.add(session)
+    
+    # 4. Consume the invite
+    invite.status = "completed"
+    invite.session_id = session_id
+    
+    await db.commit()
+
+    return SessionResponse(
+        id=session_id,
+        user_id=user_id,
+        name=data.name,
+        job_description=data.job_description,
+        company_name=data.company_name or "",
+        role_title=data.role_title or "",
+        interview_type=data.interview_type or "solo",
+        status="pending",
+        created_at=now.isoformat(),
+    )
+
 
 
 @router.get("/progress")
