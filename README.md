@@ -1,212 +1,167 @@
-# 🚀 Interviewed - Backend
+<p align="center">
+  <h1 align="center">Interviewed — Backend</h1>
+  <p align="center">AI-powered real-time interview platform built with FastAPI & Amazon Nova Sonic</p>
+</p>
 
-This is the backend service for **Interviewed**, an AI-powered interview platform utilizing real-time conversational AI, audio processing, and live code evaluation.
-
-It is built with **FastAPI**, **PostgreSQL** (via AsyncPG/SQLAlchemy), and integrates with **Amazon Nova (Bedrock)** for real-time AI capabilities.
-
-## 🌟 Features
-
-- **Real-Time Conversational AI**: WebSocket-based streaming audio processing via Amazon Nova Sonic.
-- **Session Management & Analytics**: Tracks interview metrics including confidence, typing speed (WPM), and filler word counts.
-- **Live Coding Evaluation**: Processes code challenge submissions in real-time.
-- **Resume Processing**: Parses uploaded PDFs to extract context for the AI interviewer.
-
-## 🛠️ Local Development
-
-1. Create a virtual environment:
-   ```bash
-   python3 -m venv venv
-   source venv/bin/activate
-   ```
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-3. Set up `.env` (copy from `.env.example` and fill in secrets).
-4. Run the server:
-   ```bash
-   python main.py
-   ```
+<p align="center">
+  <img src="https://img.shields.io/badge/Python-3.12-3776AB?style=flat&logo=python&logoColor=white" />
+  <img src="https://img.shields.io/badge/FastAPI-0.115-009688?style=flat&logo=fastapi&logoColor=white" />
+  <img src="https://img.shields.io/badge/PostgreSQL-AsyncPG-4169E1?style=flat&logo=postgresql&logoColor=white" />
+  <img src="https://img.shields.io/badge/AWS-Nova%20Sonic-FF9900?style=flat&logo=amazonaws&logoColor=white" />
+</p>
 
 ---
 
-## 🚀 Deployment Setup
+### 📦 Repositories
 
-This backend is set up as a **separate repository** with its own GitHub Actions workflow for EC2 deployment.
+[![Frontend](https://img.shields.io/badge/Frontend-Next.js%2016-000000?style=flat&logo=next.js)](https://github.com/Amaru333/interviewed-frontend)
+[![Backend](https://img.shields.io/badge/Backend-FastAPI-009688?style=flat&logo=fastapi)](https://github.com/Amaru333/interviewed-backend)
 
-## Quick Setup
+| Repository   | Link                                                                                                           |
+| ------------ | -------------------------------------------------------------------------------------------------------------- |
+| **Frontend** | [github.com/Amaru333/interviewed-frontend](https://github.com/Amaru333/interviewed-frontend) |
+| **Backend**  | [github.com/Amaru333/interviewed-backend](https://github.com/Amaru333/interviewed-backend)   |
 
-### 1. Initialize Git Repository
+---
 
-```bash
-cd /Users/amaru/Desktop/interviewed/backend
+## ✨ Features
 
-# Initialize git if not already done
-git init
+- **Real-Time AI Interviewing** — WebSocket-based bidirectional audio streaming via Amazon Nova Sonic with multi-panelist support
+- **Auto-Reconnect & History Replay** — Transparent session recovery with full conversation context preservation
+- **Live Code Evaluation** — Real-time code challenge delivery and submission processing during interviews
+- **Recruiter Portal** — Job management, bulk candidate invitations with expiry, and email notifications via SMTP
+- **Scoring & Analytics** — AI-generated scoring across communication, technical, problem-solving, confidence, and relevance dimensions
+- **Resume Processing** — PDF parsing for personalized AI interview context
+- **Auth System** — JWT-based authentication with role separation (candidate & recruiter)
 
-# Add all files
-git add .
+---
 
-# Create initial commit
-git commit -m "Initial backend setup"
-
-# Create GitHub repository and push
-# Go to github.com and create a new repository called "interviewed-backend"
-git remote add origin https://github.com/YOUR_USERNAME/interviewed-backend.git
-git branch -M main
-git push -u origin main
-```
-
-### 2. Add GitHub Secrets
-
-Go to: `https://github.com/YOUR_USERNAME/interviewed-backend/settings/secrets/actions`
-
-Add these 7 secrets:
-
-| Secret Name | Description |
-|-------------|-------------|
-| `EC2_SSH_KEY` | Your SSH private key for EC2 |
-| `EC2_HOST` | Your EC2 IP address (e.g., `54.123.45.67`) |
-| `EC2_USER` | EC2 username (usually `ubuntu`) |
-| `DATABASE_URL` | Database connection string |
-| `AWS_REGION` | AWS region (e.g., `us-east-1`) |
-| `AWS_ACCESS_KEY_ID` | Your AWS access key |
-| `AWS_SECRET_ACCESS_KEY` | Your AWS secret key |
-
-### 3. Deploy
-
-**Option A: Create a Release (Recommended)**
-1. Go to: `https://github.com/YOUR_USERNAME/interviewed-backend/releases`
-2. Click "Create a new release"
-3. Tag: `v1.0.0`
-4. Click "Publish release"
-5. GitHub Actions automatically deploys! 🎉
-
-**Option B: Manual Trigger**
-1. Go to: `https://github.com/YOUR_USERNAME/interviewed-backend/actions`
-2. Click "Deploy to AWS EC2"
-3. Click "Run workflow"
-4. Click green "Run workflow" button
-
-## EC2 Setup
-
-On your EC2 instance, the backend should be in `~/backend`:
-
-```bash
-ssh -i ~/Downloads/interviewed-key.pem ubuntu@YOUR_IP
-
-# Clone your backend repository
-cd ~
-git clone https://github.com/YOUR_USERNAME/interviewed-backend.git backend
-cd backend
-
-# Set up virtual environment
-python3 -m venv venv
-source venv/bin/activate
-pip install -r requirements.txt
-
-# Create start script
-cat > start.sh << 'EOF'
-#!/bin/bash
-cd /home/ubuntu/backend
-source venv/bin/activate
-python main.py
-EOF
-
-chmod +x start.sh
-
-# Start with PM2
-pm2 start start.sh --name interviewed-backend
-pm2 save
-pm2 startup
-```
-
-## Directory Structure
+## 🏗️ Architecture
 
 ```
 backend/
-├── .github/
-│   └── workflows/
-│       └── deploy.yml          # GitHub Actions workflow
-├── .env.example                # Environment variables template
-├── .gitignore                  # Git ignore file
-├── main.py                     # Main application
-├── database.py                 # Database models
-├── auth.py                     # Authentication
-├── interview_nova_sonic.py     # Nova Sonic integration
-├── requirements.txt            # Python dependencies
-├── routes/                     # API routes
-│   ├── auth_routes.py
-│   ├── session_routes.py
-│   └── resume_routes.py
-└── README.md                   # This file
+├── main.py                      # FastAPI app, WebSocket handler, InterviewConnectionManager
+├── database.py                  # SQLAlchemy async models (User, Session, Message, etc.)
+├── models.py                    # Pydantic request/response schemas
+├── auth.py                      # JWT authentication utilities
+├── email_service.py             # SMTP email service for interview invites
+├── interview_nova_sonic.py      # Amazon Nova Sonic streaming client
+├── routes/
+│   ├── auth_routes.py           # Login, register, user profile
+│   ├── session_routes.py        # Interview sessions, scoring, analytics
+│   ├── recruiter_routes.py      # Jobs, invites, candidate pipeline
+│   └── resume_routes.py         # Resume upload & parsing
+├── .github/workflows/
+│   └── deploy.yml               # GitHub Actions → EC2 deployment
+└── requirements.txt
 ```
-
-## Environment Variables
-
-Create a `.env` file for local development:
-
-```bash
-cp .env.example .env
-nano .env
-```
-
-Add your credentials:
-```env
-DATABASE_URL=postgresql+asyncpg://user:password@host:5432/database
-AWS_REGION=us-east-1
-AWS_ACCESS_KEY_ID=your_key
-AWS_SECRET_ACCESS_KEY=your_secret
-```
-
-## Development
-
-```bash
-# Activate virtual environment
-source venv/bin/activate
-
-# Run the app
-python main.py
-
-# Visit: http://localhost:8000
-```
-
-## Deployment Workflow
-
-1. Make changes to your code
-2. Commit and push:
-   ```bash
-   git add .
-   git commit -m "Your changes"
-   git push origin main
-   ```
-3. Create a release on GitHub
-4. GitHub Actions automatically deploys to EC2
-5. Done! 🎉
-
-## Troubleshooting
-
-**Problem: GitHub Actions can't connect to EC2**
-- Check all 7 secrets are added
-- Verify EC2 is running
-- Check security group allows SSH (port 22)
-
-**Problem: App won't start**
-- SSH to EC2: `ssh -i ~/.ssh/deploy_key ubuntu@YOUR_IP`
-- Check logs: `pm2 logs interviewed-backend`
-- Check env vars: `cat ~/backend/.env`
-
-**Problem: Database connection failed**
-- Verify `DATABASE_URL` in GitHub Secrets
-- Check database allows connections from EC2 IP
-- Install correct driver: `pip install asyncpg` (PostgreSQL) or `pip install aiomysql` (MySQL)
-
-## Documentation
-
-- See `DATABASE_MIGRATION_GUIDE.md` for database setup
-- See `DEPLOYMENT_SUMMARY.md` for quick reference
-- See `AWS_DEPLOYMENT_GUIDE.md` for full AWS setup
 
 ---
 
-**Ready to deploy?** Just create a GitHub release! 🚀
+## 🚀 Getting Started
+
+### Prerequisites
+
+- Python 3.12+
+- PostgreSQL (or SQLite for local dev)
+- AWS credentials with Bedrock access
+
+### Setup
+
+```bash
+# Clone the repository
+git clone https://github.com/Amaru333/interviewed-backend.git
+cd interviewed-backend
+
+# Create virtual environment
+python3 -m venv venv
+source venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt
+
+# Configure environment
+cp .env.example .env
+# Edit .env with your credentials
+
+# Run the server
+python main.py
+```
+
+The API will be available at `http://localhost:8000`.
+
+---
+
+## ⚙️ Environment Variables
+
+| Variable | Description | Default |
+|---|---|---|
+| `DATABASE_URL` | Database connection string | `sqlite+aiosqlite:///./interviewed.db` |
+| `AWS_REGION` | AWS region for Bedrock | `us-east-1` |
+| `AWS_ACCESS_KEY_ID` | AWS access key | — |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key | — |
+| `SECRET_KEY` | JWT signing key | Auto-generated |
+| `SMTP_HOST` | SMTP server hostname | `smtp.gmail.com` |
+| `SMTP_PORT` | SMTP server port | `587` |
+| `SMTP_USER` | SMTP username/email | — |
+| `SMTP_PASSWORD` | SMTP password (app password) | — |
+| `FRONTEND_URL` | Frontend URL for invite links | `http://localhost:3000` |
+
+---
+
+## 🔌 API Overview
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/auth/register` | Register a new user |
+| `POST` | `/auth/login` | Login and receive JWT |
+| `GET` | `/auth/me` | Get current user profile |
+| `WS` | `/ws/interview/{session_id}` | Real-time interview WebSocket |
+| `POST` | `/sessions` | Create a new interview session |
+| `GET` | `/sessions` | List user's sessions |
+| `GET` | `/sessions/{id}/results` | Get session results & scores |
+| `POST` | `/resume/upload` | Upload and parse resume PDF |
+| `POST` | `/recruiter/register` | Register recruiter account |
+| `POST` | `/recruiter/jobs` | Create a job listing |
+| `POST` | `/recruiter/jobs/{id}/invite` | Bulk invite candidates |
+
+---
+
+## 🚢 Deployment
+
+The backend deploys to **AWS EC2** via GitHub Actions. Deployment is triggered by creating a GitHub release or manually via the Actions tab.
+
+### GitHub Secrets Required
+
+| Secret | Description |
+|---|---|
+| `EC2_SSH_KEY` | SSH private key for EC2 |
+| `EC2_HOST` | EC2 instance IP address |
+| `EC2_USER` | EC2 username (`ubuntu`) |
+| `DATABASE_URL` | Production database URL |
+| `AWS_REGION` | AWS region |
+| `AWS_ACCESS_KEY_ID` | AWS access key |
+| `AWS_SECRET_ACCESS_KEY` | AWS secret key |
+
+### Deploy
+
+```bash
+# Push to main and create a release tag
+git tag v1.0.0
+git push origin v1.0.0
+# → GitHub Actions handles the rest
+```
+
+On EC2, the app runs via PM2:
+
+```bash
+pm2 logs interviewed-backend     # View logs
+pm2 restart interviewed-backend  # Restart
+pm2 status                       # Check status
+```
+
+---
+
+## 📄 License
+
+This project is part of the Interviewed platform.
