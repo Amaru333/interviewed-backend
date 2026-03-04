@@ -10,9 +10,11 @@ import secrets
 from database import get_db, Recruiter, Job, InterviewInvite, SessionScore, Session
 from models import (
     RecruiterRegister, RecruiterLogin, RecruiterResponse, RecruiterTokenResponse,
-    JobCreate, JobResponse, InviteCreate, InviteResponse, JobWithInvitesResponse
+    JobCreate, JobResponse, InviteCreate, InviteResponse, JobWithInvitesResponse,
+    BulkInviteCreate, BulkInviteResponse, InviteScoreSummary
 )
 from auth import hash_password, verify_password, create_access_token, get_current_recruiter_id
+from email_service import send_invite_email
 
 router = APIRouter(prefix="/api/recruiter", tags=["recruiter"])
 
@@ -138,9 +140,15 @@ async def list_jobs(current_id: str = Depends(get_current_recruiter_id), db: Asy
 
 @router.get("/jobs/{job_id}", response_model=JobWithInvitesResponse)
 async def get_job_details(job_id: str, current_id: str = Depends(get_current_recruiter_id), db: AsyncSession = Depends(get_db)):
-    # Validate job belongs to recruiter and fetch with invites
+    # Validate job belongs to recruiter and fetch with invites + session scores
     result = await db.execute(
-        select(Job).options(selectinload(Job.invites)).where(Job.id == job_id, Job.recruiter_id == current_id)
+        select(Job)
+        .options(
+            selectinload(Job.invites)
+            .selectinload(InterviewInvite.session)
+            .selectinload(Session.score)
+        )
+        .where(Job.id == job_id, Job.recruiter_id == current_id)
     )
     job = result.scalars().first()
     if not job:
@@ -151,6 +159,32 @@ async def get_job_details(job_id: str, current_id: str = Depends(get_current_rec
     
     for invite in job.invites:
         stats[invite.status] = stats.get(invite.status, 0) + 1
+        
+        # Build score summary if the interview is completed and has scores
+        score_summary = None
+        if invite.session_id and invite.session and hasattr(invite.session, 'score') and invite.session.score:
+            sc = invite.session.score
+            import json
+            try:
+                strengths = json.loads(sc.strengths) if isinstance(sc.strengths, str) else sc.strengths
+            except (json.JSONDecodeError, TypeError):
+                strengths = []
+            try:
+                improvements = json.loads(sc.improvements) if isinstance(sc.improvements, str) else sc.improvements
+            except (json.JSONDecodeError, TypeError):
+                improvements = []
+            
+            score_summary = InviteScoreSummary(
+                overall_score=sc.overall_score,
+                communication_score=sc.communication_score,
+                technical_score=sc.technical_score,
+                problem_solving_score=sc.problem_solving_score,
+                confidence_score=sc.confidence_score,
+                relevance_score=sc.relevance_score,
+                strengths=strengths,
+                improvements=improvements,
+            )
+        
         invites_resp.append(
             InviteResponse(
                 id=invite.id,
@@ -159,6 +193,7 @@ async def get_job_details(job_id: str, current_id: str = Depends(get_current_rec
                 token=invite.token,
                 status=invite.status,
                 session_id=invite.session_id,
+                score_summary=score_summary,
                 expires_at=invite.expires_at.isoformat(),
                 created_at=invite.created_at.isoformat()
             )
@@ -182,11 +217,15 @@ async def get_job_details(job_id: str, current_id: str = Depends(get_current_rec
 
 @router.post("/jobs/{job_id}/invite", response_model=InviteResponse)
 async def invite_candidate(job_id: str, req: InviteCreate, current_id: str = Depends(get_current_recruiter_id), db: AsyncSession = Depends(get_db)):
-    # Validate job ownership
+    # Validate job ownership and get recruiter for company name
     result = await db.execute(select(Job).where(Job.id == job_id, Job.recruiter_id == current_id))
     job = result.scalars().first()
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    
+    recruiter_result = await db.execute(select(Recruiter).where(Recruiter.id == current_id))
+    recruiter = recruiter_result.scalars().first()
+    company_name = recruiter.company_name if recruiter else "Our Company"
         
     invite_id = f"inv_{uuid.uuid4().hex[:12]}"
     token = secrets.token_urlsafe(32) # Secure random token for URL
@@ -205,6 +244,15 @@ async def invite_candidate(job_id: str, req: InviteCreate, current_id: str = Dep
     await db.commit()
     await db.refresh(new_invite)
     
+    # Send invite email (non-blocking, doesn't fail the request)
+    await send_invite_email(
+        candidate_email=req.candidate_email,
+        job_title=job.title,
+        company_name=company_name,
+        invite_token=token,
+        expires_at=expires_at,
+    )
+    
     return InviteResponse(
         id=new_invite.id,
         job_id=new_invite.job_id,
@@ -215,3 +263,82 @@ async def invite_candidate(job_id: str, req: InviteCreate, current_id: str = Dep
         expires_at=new_invite.expires_at.isoformat(),
         created_at=new_invite.created_at.isoformat()
     )
+
+
+@router.post("/jobs/{job_id}/invite/bulk", response_model=BulkInviteResponse)
+async def bulk_invite_candidates(job_id: str, req: BulkInviteCreate, current_id: str = Depends(get_current_recruiter_id), db: AsyncSession = Depends(get_db)):
+    # Validate job ownership and get recruiter for company name
+    result = await db.execute(select(Job).where(Job.id == job_id, Job.recruiter_id == current_id))
+    job = result.scalars().first()
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
+    
+    recruiter_result = await db.execute(select(Recruiter).where(Recruiter.id == current_id))
+    recruiter = recruiter_result.scalars().first()
+    company_name = recruiter.company_name if recruiter else "Our Company"
+
+    invited = []
+    errors = []
+    expires_at = datetime.utcnow() + timedelta(days=req.expires_in_days)
+
+    for email_raw in req.candidate_emails:
+        email = email_raw.strip().lower()
+        if not email:
+            continue
+
+        # Basic email validation
+        if "@" not in email or "." not in email.split("@")[-1]:
+            errors.append({"email": email, "reason": "Invalid email format"})
+            continue
+
+        # Check for duplicate invite on this job
+        existing = await db.execute(
+            select(InterviewInvite).where(
+                InterviewInvite.job_id == job_id,
+                InterviewInvite.candidate_email == email
+            )
+        )
+        if existing.scalars().first():
+            errors.append({"email": email, "reason": "Already invited"})
+            continue
+
+        invite_id = f"inv_{uuid.uuid4().hex[:12]}"
+        token = secrets.token_urlsafe(32)
+
+        new_invite = InterviewInvite(
+            id=invite_id,
+            job_id=job_id,
+            candidate_email=email,
+            token=token,
+            status="pending",
+            expires_at=expires_at
+        )
+        db.add(new_invite)
+        await db.flush()
+        await db.refresh(new_invite)
+
+        invited.append(
+            InviteResponse(
+                id=new_invite.id,
+                job_id=new_invite.job_id,
+                candidate_email=new_invite.candidate_email,
+                token=new_invite.token,
+                status=new_invite.status,
+                session_id=new_invite.session_id,
+                expires_at=new_invite.expires_at.isoformat(),
+                created_at=new_invite.created_at.isoformat()
+            )
+        )
+
+        # Send invite email (non-blocking, doesn't fail the request)
+        await send_invite_email(
+            candidate_email=email,
+            job_title=job.title,
+            company_name=company_name,
+            invite_token=token,
+            expires_at=expires_at,
+        )
+
+    await db.commit()
+
+    return BulkInviteResponse(invited=invited, errors=errors)

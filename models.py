@@ -81,6 +81,22 @@ class InviteCreate(BaseModel):
     expires_in_days: int = 7
 
 
+class BulkInviteCreate(BaseModel):
+    candidate_emails: List[str]
+    expires_in_days: int = 7
+
+
+class InviteScoreSummary(BaseModel):
+    overall_score: float
+    communication_score: float
+    technical_score: float
+    problem_solving_score: float
+    confidence_score: float
+    relevance_score: float
+    strengths: List[str]
+    improvements: List[str]
+
+
 class InviteResponse(BaseModel):
     id: str
     job_id: str
@@ -88,8 +104,14 @@ class InviteResponse(BaseModel):
     token: str
     status: str
     session_id: Optional[str] = None
+    score_summary: Optional[InviteScoreSummary] = None
     expires_at: str
     created_at: str
+
+
+class BulkInviteResponse(BaseModel):
+    invited: List[InviteResponse]
+    errors: List[dict]
 
 
 class JobWithInvitesResponse(BaseModel):
