@@ -12,7 +12,7 @@
 
 ---
 
-### 📦 Repositories
+### Repositories
 
 [![Frontend](https://img.shields.io/badge/Frontend-Next.js%2016-000000?style=flat&logo=next.js)](https://github.com/Amaru333/interviewed-frontend)
 [![Backend](https://img.shields.io/badge/Backend-FastAPI-009688?style=flat&logo=fastapi)](https://github.com/Amaru333/interviewed-backend)
@@ -24,7 +24,7 @@
 
 ---
 
-## ✨ Features
+## Features
 
 - **Real-Time AI Interviewing** — WebSocket-based bidirectional audio streaming via Amazon Nova Sonic with multi-panelist support
 - **Auto-Reconnect & History Replay** — Transparent session recovery with full conversation context preservation
@@ -36,7 +36,7 @@
 
 ---
 
-## 🏗️ Architecture
+## Architecture
 
 ```
 backend/
@@ -58,7 +58,12 @@ backend/
 
 ---
 
-## 🚀 Getting Started
+## Database Relationship
+<img width="1281" height="865" alt="Screenshot 2026-03-10 at 8 46 40 PM" src="https://github.com/user-attachments/assets/601c5884-51c7-4265-aee5-cadcdc621307" />
+
+---
+
+## Getting Started
 
 ### Prerequisites
 
@@ -109,7 +114,7 @@ The API will be available at `http://localhost:8000`.
 
 ---
 
-## 🔌 API Overview
+## API Overview
 
 | Method | Endpoint | Description |
 |---|---|---|
@@ -127,7 +132,7 @@ The API will be available at `http://localhost:8000`.
 
 ---
 
-## 🚢 Deployment
+## Deployment
 
 The backend deploys to **AWS EC2** via GitHub Actions. Deployment is triggered by creating a GitHub release or manually via the Actions tab.
 
@@ -162,6 +167,6 @@ pm2 status                       # Check status
 
 ---
 
-## 📄 License
+## License
 
 This project is part of the Interviewed platform.
